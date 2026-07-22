@@ -65,7 +65,7 @@ fn usage(code: i32) {
                -A resume  -J json  -r recurse dirs  -R BYTES\n\
                -z reverse\n\
          cp defaults: -c -e on. -A resumes partial dest.\n\
-         BBX_REMOTE=  BBX_ADVERTISE=\n"
+         BBX_REMOTE=  BBX_ADVERTISE=  BBX_KEY=\n"
     );
     std::process::exit(code);
 }
@@ -236,6 +236,13 @@ fn gen_key() -> [u8; 32] {
     k
 }
 
+/// Session key from the `BBX_KEY` environment variable, if present and valid.
+/// Preferred over `-k` on the remote side: env is not shown by a plain `ps`.
+fn env_key() -> Option<[u8; 32]> {
+    let s = env::var("BBX_KEY").ok()?;
+    parse_key(&s).ok()
+}
+
 /// Quote a path/arg for remote `sh` via ssh.
 /// Leading `~/` becomes `"$HOME/..."` so tilde expands (single-quoted `~` does not).
 fn shell_quote(s: &str) -> String {
@@ -277,7 +284,7 @@ fn resume_flag(resume: bool) -> &'static str {
 fn cmd_sink(args: &[String]) -> Result<(), String> {
     let f = parse_flags(args)?;
     let out = f.output.ok_or("sink needs -o FILE")?;
-    let key = f.key;
+    let key = f.key.or_else(env_key);
     let crypt = f.crypt || key.is_some();
     match (&f.listen, &f.addr) {
         (Some(l), None) => {
@@ -293,7 +300,7 @@ fn cmd_sink(args: &[String]) -> Result<(), String> {
 fn cmd_source(args: &[String]) -> Result<(), String> {
     let f = parse_flags(args)?;
     let input = f.input.ok_or("source needs -i FILE")?;
-    let key = f.key;
+    let key = f.key.or_else(env_key);
     let crypt = f.crypt || key.is_some();
     let rf = f.resume_from;
     match (&f.listen, &f.addr) {
@@ -675,12 +682,14 @@ fn cp_push_reverse(
     let addr = format!("{advertise}:{port}");
     let key = if crypt { Some(gen_key()) } else { None };
     let ce = ce_flags(check, crypt);
-    let karg = key
+    // Pass the key via env (BBX_KEY=), not `-k` on argv: env is not visible to a
+    // plain `ps` on the remote. The remote bbx picks it up when no -k is given.
+    let kenv = key
         .as_ref()
-        .map(|k| format!(" -k {}", hex(k)))
+        .map(|k| format!("BBX_KEY={} ", hex(k)))
         .unwrap_or_default();
     let cmd = format!(
-        "{} sink -a {} -o {} -s {streams} -w {wnd} {ce}{}{karg}",
+        "{kenv}{} sink -a {} -o {} -s {streams} -w {wnd} {ce}{}",
         shell_quote(bin),
         shell_quote(&addr),
         shell_quote(rpath),
@@ -719,9 +728,10 @@ fn cp_pull_forward(
     let addr = format!("{advertise}:{port}");
     let key = if crypt { Some(gen_key()) } else { None };
     let ce = ce_flags(check, crypt);
-    let karg = key
+    // Key via env (BBX_KEY=), not `-k` on argv — hidden from a plain remote `ps`.
+    let kenv = key
         .as_ref()
-        .map(|k| format!(" -k {}", hex(k)))
+        .map(|k| format!("BBX_KEY={} ", hex(k)))
         .unwrap_or_default();
     let rf = if resume {
         std::fs::metadata(local_dst).map(|m| m.len()).unwrap_or(0)
@@ -734,7 +744,7 @@ fn cp_pull_forward(
         String::new()
     };
     let cmd = format!(
-        "{} source -a {} -i {} -s {streams} -w {wnd} {ce}{karg}{rarg}",
+        "{kenv}{} source -a {} -i {} -s {streams} -w {wnd} {ce}{rarg}",
         shell_quote(bin),
         shell_quote(&addr),
         shell_quote(rpath)
