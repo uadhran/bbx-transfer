@@ -998,11 +998,10 @@ fn run_sink_with_listener(
     resume: bool,
     json: bool,
 ) -> Result<(), String> {
+    set_accept_timeout(&listener);
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
-        let (s, _) = listener
-            .accept()
-            .map_err(|e| format!("sink accept[{i}]: {e}"))?;
+        let (s, _) = listener.accept().map_err(|e| accept_err("sink", i, e))?;
         tune(&s, wnd);
         conns.push(s);
     }
@@ -1227,11 +1226,10 @@ fn run_source_with_listener(
     resume_from: u64,
     json: bool,
 ) -> Result<(), String> {
+    set_accept_timeout(&listener);
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
-        let (s, _) = listener
-            .accept()
-            .map_err(|e| format!("source accept[{i}]: {e}"))?;
+        let (s, _) = listener.accept().map_err(|e| accept_err("source", i, e))?;
         tune(&s, wnd);
         conns.push(s);
     }
@@ -1596,6 +1594,40 @@ fn io_err(stream_id: u32, op: &str, e: String) -> String {
         format!("stream {stream_id} {op} timed out after {}s (peer stalled or dead)", io_timeout().as_secs())
     } else {
         format!("stream {stream_id} {op}: {e}")
+    }
+}
+
+/// Bound `accept()` so a listening side with no dialer doesn't block forever.
+/// SO_RCVTIMEO makes accept() return WouldBlock after the timeout on Unix.
+#[cfg(unix)]
+fn set_accept_timeout(l: &TcpListener) {
+    use std::os::unix::io::AsRawFd;
+    let tv = libc::timeval {
+        tv_sec: io_timeout().as_secs() as libc::time_t,
+        tv_usec: 0,
+    };
+    unsafe {
+        libc::setsockopt(
+            l.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const _ as *const _,
+            std::mem::size_of_val(&tv) as libc::socklen_t,
+        );
+    }
+}
+#[cfg(not(unix))]
+fn set_accept_timeout(_l: &TcpListener) {}
+
+fn accept_err(role: &str, i: usize, e: std::io::Error) -> String {
+    use std::io::ErrorKind::{TimedOut, WouldBlock};
+    if matches!(e.kind(), WouldBlock | TimedOut) {
+        format!(
+            "{role} accept[{i}] timed out after {}s (no peer connected)",
+            io_timeout().as_secs()
+        )
+    } else {
+        format!("{role} accept[{i}]: {e}")
     }
 }
 

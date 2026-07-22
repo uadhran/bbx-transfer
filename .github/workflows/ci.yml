@@ -87,3 +87,8 @@ jobs:
             echo "expected source to fail against a stalled peer"; kill $PYPID; exit 1
           fi
           kill $PYPID 2>/dev/null || true
+          # listener with no dialer must time out on accept, not hang
+          rm -f /tmp/bbx-noconn.out
+          if BBX_IO_TIMEOUT_SECS=2 timeout 30 $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-noconn.out -s 2 -C -E; then
+            echo "expected sink to fail when no peer connects"; exit 1
+          fi
