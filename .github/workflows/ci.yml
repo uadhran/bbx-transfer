@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: test
+        run: cargo test --all
+      - name: build release
+        run: cargo build --release
+      - name: smoke transfer + blake3
+        run: |
+          set -euo pipefail
+          BIN=./target/release/bbx
+          dd if=/dev/urandom of=/tmp/bbx-in.bin bs=1M count=8 status=none
+          rm -f /tmp/bbx-out.bin /tmp/bbx-port.txt
+          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-out.bin -s 4 -c > /tmp/bbx-port.txt &
+          SPID=$!
+          for i in $(seq 1 50); do test -s /tmp/bbx-port.txt && break; sleep 0.05; done
+          PORT=$(awk '{print $2}' /tmp/bbx-port.txt)
+          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -c -P 1
+          wait $SPID
+          cmp /tmp/bbx-in.bin /tmp/bbx-out.bin
+          # reverse smoke
+          rm -f /tmp/bbx-out2.bin
+          $BIN source -l 127.0.0.1:0 -i /tmp/bbx-in.bin -s 2 -c > /tmp/bbx-port2.txt &
+          SPID=$!
+          for i in $(seq 1 50); do test -s /tmp/bbx-port2.txt && break; sleep 0.05; done
+          PORT=$(awk '{print $2}' /tmp/bbx-port2.txt)
+          $BIN sink -a "127.0.0.1:$PORT" -o /tmp/bbx-out2.bin -s 2 -c
+          wait $SPID
+          cmp /tmp/bbx-in.bin /tmp/bbx-out2.bin

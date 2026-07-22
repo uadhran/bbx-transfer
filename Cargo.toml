@@ -1,0 +1,17 @@
+[package]
+name = "bbx"
+version = "0.2.0"
+edition = "2021"
+description = "Multi-stream bulk copy — open BBX2 protocol, BLAKE3 verify, push/pull/reverse"
+license = "MIT"
+readme = "README.md"
+keywords = ["copy", "transfer", "scp", "bbcp", "network"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+libc = "0.2"
+blake3 = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
