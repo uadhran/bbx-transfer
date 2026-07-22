@@ -447,6 +447,22 @@ fn parent_posix(path: &str) -> Option<String> {
     path.rfind('/').map(|i| path[..i].to_string())
 }
 
+/// A relative path from a remote `find` is untrusted: reject anything that is
+/// absolute or contains a `..` component so a compromised remote can't make us
+/// write outside the local destination directory (path traversal).
+fn is_safe_rel(rel: &str) -> bool {
+    use std::path::Component;
+    if rel.is_empty() {
+        return false;
+    }
+    let p = std::path::Path::new(rel);
+    if p.is_absolute() {
+        return false;
+    }
+    p.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
 /// Sequential multi-file push (one BBX2 session per file). Clear, correct, not fancy.
 fn cp_push_tree(
     bin: &str,
@@ -533,6 +549,9 @@ fn cp_pull_tree(
         eprintln!("bbx: pull -r {} files from {}:{rpath}", files.len(), remote);
     }
     for (i, rel) in files.iter().enumerate() {
+        if !is_safe_rel(rel) {
+            return Err(format!("unsafe remote path rejected: {rel}"));
+        }
         let remote_file = join_remote(rpath, rel);
         let local_file = std::path::Path::new(local_dst).join(rel);
         if let Some(parent) = local_file.parent() {
@@ -1202,7 +1221,10 @@ fn finish_source(
     if resume_from > size {
         return Err(format!("resume_from {resume_from} > file size {size}"));
     }
-    if resume_from == size {
+    // Only short-circuit a genuine resume that is already complete. For a
+    // real 0-byte file resume_from == size == 0, and we must still send the
+    // header so the sink can create + set_len(0) the destination.
+    if resume_from == size && resume_from > 0 {
         if json {
             println!(r#"{{"event":"done","bytes":{size},"total":{size},"resumed_from":{resume_from},"skipped":true}}"#);
         } else {
@@ -1563,6 +1585,16 @@ mod tests {
     fn remote_spec() {
         assert!(is_remote_spec("user@host:/tmp/x"));
         assert!(!is_remote_spec("/tmp/x"));
+    }
+
+    #[test]
+    fn rejects_unsafe_remote_paths() {
+        assert!(is_safe_rel("a/b/c.txt"));
+        assert!(is_safe_rel("root.bin"));
+        assert!(!is_safe_rel("/etc/passwd"));
+        assert!(!is_safe_rel("../secrets"));
+        assert!(!is_safe_rel("a/../../b"));
+        assert!(!is_safe_rel(""));
     }
 
     #[test]

@@ -49,3 +49,23 @@ jobs:
           $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -C -E -R "$RF"
           wait $SPID
           cmp /tmp/bbx-in.bin /tmp/bbx-part.bin
+          # empty file (must transfer, not silently skip)
+          rm -f /tmp/bbx-empty.in /tmp/bbx-empty.out /tmp/bbx-porte.txt
+          : > /tmp/bbx-empty.in
+          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-empty.out -s 4 -C -E > /tmp/bbx-porte.txt &
+          SPID=$!
+          for i in $(seq 1 50); do test -s /tmp/bbx-porte.txt && break; sleep 0.05; done
+          PORT=$(awk '/^PORT/{print $2; exit}' /tmp/bbx-porte.txt)
+          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-empty.in -s 4 -C -E
+          wait $SPID
+          test -f /tmp/bbx-empty.out
+          cmp /tmp/bbx-empty.in /tmp/bbx-empty.out
+          # single stream
+          rm -f /tmp/bbx-out1.bin /tmp/bbx-port1.txt
+          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-out1.bin -s 1 -c -E > /tmp/bbx-port1.txt &
+          SPID=$!
+          for i in $(seq 1 50); do test -s /tmp/bbx-port1.txt && break; sleep 0.05; done
+          PORT=$(awk '/^PORT/{print $2; exit}' /tmp/bbx-port1.txt)
+          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 1 -c -E
+          wait $SPID
+          cmp /tmp/bbx-in.bin /tmp/bbx-out1.bin
