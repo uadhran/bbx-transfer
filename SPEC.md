@@ -1,6 +1,6 @@
 # BBX2 wire protocol
 
-Version **2**. Not compatible with bbcp or BBX1.
+Version **2**. Not compatible with bbcp.
 
 ## Roles
 
@@ -13,49 +13,66 @@ Either side may **listen** or **connect** (forward vs reverse).
 
 ## Streams
 
-- Exactly **N** TCP connections (N = 1..64), negotiated in the control header.
-- Connection **0** is the control stream (header + file range 0).
-- Connections **1..N-1** carry only payload for their range.
-- File size `S` is split into N exclusive ranges `[start, end)` (sizes differ by at most 1 byte).
+- Exactly **N** TCP connections (N = 1..64).
+- Connection **0** is control (header + range 0 payload).
+- Connections **1..N-1** carry only their range payload.
+- File size `S` split into N exclusive ranges (sizes differ by ≤1).
 
-## Control header (stream 0, before payload)
+## Control header (stream 0)
 
-All multi-byte integers are **little-endian**.
+Little-endian integers.
 
 | Field | Size | Notes |
 |-------|------|--------|
-| magic | 4 | `BBX2` (`0x42 0x42 0x58 0x32`) |
-| flags | u32 | bit0 = `FLAG_BLAKE3` (1) |
-| size | u64 | file size in bytes |
+| magic | 4 | `BBX2` |
+| flags | u32 | bit0 `FLAG_BLAKE3` (1), bit1 `FLAG_CRYPT` (2) |
+| size | u64 | file bytes |
 | streams | u32 | N |
-| blake3 | 32 | only if `FLAG_BLAKE3`; digest of full file |
+| blake3 | 32 | if `FLAG_BLAKE3` |
 
-Then stream 0 immediately sends `range[0]` raw bytes. Other streams send only their range bytes (no per-chunk framing).
+## Payload
+
+### Cleartext (`FLAG_CRYPT` clear)
+
+Raw range bytes (no framing).
+
+### Encrypted (`FLAG_CRYPT` set)
+
+Session **PSK** is 32 random bytes, shared **out of band** (SSH agent banner or `-k`).
+
+Each stream encrypts independently with **ChaCha20-Poly1305**:
+
+- Nonce (12 bytes) = `stream_id` (u32 LE) ‖ `counter` (u64 LE), counter from 0 per stream.
+- Frames: `u32 LE ciphertext_len` ‖ ciphertext (includes 16-byte tag).
+- Max plaintext per frame: 65536 bytes.
 
 ## Integrity
 
-When `FLAG_BLAKE3` is set:
+`FLAG_BLAKE3`: source hashes file before send; sink re-hashes after write; must match.
 
-1. Source hashes the file (BLAKE3) before send and includes the 32-byte digest.
-2. Sink writes the file, then hashes the result and **must** match or abort.
+## SSH agent banner
 
-## SSH orchestration (`bbx cp`)
+Listener prints on stdout:
 
-Out of band (not on the data sockets):
-
-- `BBX_REMOTE` — path to `bbx` on the remote host.
-- `BBX_ADVERTISE` — address remote should dial for reverse/pull (default: guessed local IP).
-- Listener side prints `PORT <u16>\n` on stdout once bound.
+```
+PORT <u16>
+KEY <64 hex chars>    # only if encrypting
+```
 
 | Mode | Data plane |
 |------|------------|
 | push | remote sink listens; local source connects |
-| push `-z` | local source listens; remote sink connects to `BBX_ADVERTISE` |
-| pull | local sink listens; remote source connects to `BBX_ADVERTISE` |
+| push `-z` | local source listens; remote sink dials `BBX_ADVERTISE` (+ `-k`) |
+| pull | local sink listens; remote source dials |
 | pull `-z` | remote source listens; local sink connects |
 
-**Threat model:** data plane is **cleartext TCP**. Use a trusted network or tunnel. Auth is SSH for agent start only.
+## Threat model
+
+- **SSH** authenticates agent start and can carry the session PSK (banner / argv).
+- **Data plane** with `-e`: confidentiality + integrity of payload (AEAD).
+- **Without `-e`**: cleartext TCP (trusted network only).
+- PSK on process argv (`-k`) is visible to local `ps` — acceptable for lab; prefer banner KEY on listener path.
 
 ## Versioning
 
-Bump magic (`BBX3`, …) for breaking changes. Never reuse `BBX2` for incompatible layouts.
+Incompatible layouts → new magic (`BBX3`, …).

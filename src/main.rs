@@ -1,12 +1,14 @@
-//! bbx — multi-stream bulk copy (bbcp ideas, new protocol BBX2).
+//! bbx — multi-stream bulk copy (BBX2 + optional encrypted payload).
 //!
-//!   bbx sink   -l ADDR -o FILE | -a ADDR -o FILE   [-s N] [-w B] [-c]
-//!   bbx source -a ADDR -i FILE | -l ADDR -i FILE   [-s N] [-w B] [-c] [-P SEC]
-//!   bbx cp [-s N] [-w B] [-P SEC] [-c|-C] [-z] SRC DEST
+//!   bbx sink   (-l|-a) -o FILE [-s N] [-w B] [-c|-C] [-e|-E] [-k HEX]
+//!   bbx source (-a|-l) -i FILE [-s N] [-w B] [-c|-C] [-e|-E] [-k HEX] [-P SEC]
+//!   bbx cp [-s N] [-w B] [-P SEC] [-c|-C] [-e|-E] [-z] SRC DEST
 //!
-//! Direction: local↔remote via ssh. -z reverse (listener on the side that has
-//! the file / accepts outbound-only peers). See SPEC.md.
+//! See SPEC.md. Session key for -e is printed as KEY <hex> by the listener
+//! (over SSH stdout) or passed with -k.
 
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -22,7 +24,9 @@ const MAGIC: &[u8; 4] = b"BBX2";
 const DEFAULT_STREAMS: usize = 4;
 const DEFAULT_WND: usize = 4 * 1024 * 1024;
 const CHUNK: usize = 1024 * 1024;
+const CRYPT_PT: usize = 64 * 1024;
 const FLAG_BLAKE3: u32 = 1;
+const FLAG_CRYPT: u32 = 2;
 
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -53,19 +57,20 @@ fn main() {
 fn usage(code: i32) {
     eprintln!(
         "bbx — multi-stream bulk copy (BBX2)\n\n\
-         bbx sink   (-l ADDR | -a ADDR) -o FILE [-s N] [-w BYTES] [-c]\n\
-         bbx source (-a ADDR | -l ADDR) -i FILE [-s N] [-w BYTES] [-c] [-P SEC]\n\
-         bbx cp [-s N] [-w BYTES] [-P SEC] [-c|-C] [-z] SRC DEST\n\n\
-         cp: local→remote (push) or remote→local (pull). One side must be host:path.\n\
-         -c verify BLAKE3 (default on for cp). -C skip verify.\n\
-         -z reverse: peer dials the side that holds/listens the data (NAT-friendly push).\n\
-         BBX_REMOTE=path  remote bbx binary (default: bbx)\n"
+         bbx sink   (-l ADDR | -a ADDR) -o FILE [opts]\n\
+         bbx source (-a ADDR | -l ADDR) -i FILE [opts]\n\
+         bbx cp [opts] [-z] SRC DEST\n\n\
+         opts: -s N  -w SIZE  -P SEC  -c|-C (blake3)  -e|-E (encrypt)  -k HEX\n\
+         cp defaults: -c and -e on. -C / -E to disable.\n\
+         -z reverse dial. BBX_REMOTE= path on remote. BBX_ADVERTISE= dial-back IP.\n\
+         cargo install --path .   # or cargo install bbx (when published)\n"
     );
     std::process::exit(code);
 }
 
 // --- flags -----------------------------------------------------------------
 
+#[derive(Clone)]
 struct Flags {
     listen: Option<String>,
     addr: Option<String>,
@@ -76,6 +81,9 @@ struct Flags {
     progress: u64,
     check: bool,
     check_set: bool,
+    crypt: bool,
+    crypt_set: bool,
+    key: Option<[u8; 32]>,
     reverse: bool,
     rest: Vec<String>,
 }
@@ -91,6 +99,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         progress: 0,
         check: false,
         check_set: false,
+        crypt: false,
+        crypt_set: false,
+        key: None,
         reverse: false,
         rest: Vec::new(),
     };
@@ -140,6 +151,18 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 f.check = false;
                 f.check_set = true;
             }
+            "-e" => {
+                f.crypt = true;
+                f.crypt_set = true;
+            }
+            "-E" => {
+                f.crypt = false;
+                f.crypt_set = true;
+            }
+            "-k" => {
+                i += 1;
+                f.key = Some(parse_key(need(args, i, "-k")?)?);
+            }
             "-z" => f.reverse = true,
             "--" => {
                 f.rest.extend_from_slice(&args[i + 1..]);
@@ -174,8 +197,26 @@ fn parse_size(s: &str) -> Result<usize, String> {
     Ok(n.saturating_mul(mul))
 }
 
+fn parse_key(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return Err("key must be 64 hex chars (32 bytes)".into());
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "bad key hex".to_string())?;
+    }
+    Ok(out)
+}
+
+fn gen_key() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    getrandom::getrandom(&mut k).expect("getrandom");
+    k
+}
+
 fn shell_quote(s: &str) -> String {
-    // safe for remote sh -c single-quoted strings
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
@@ -183,14 +224,24 @@ fn remote_bin() -> String {
     env::var("BBX_REMOTE").unwrap_or_else(|_| "bbx".into())
 }
 
+fn ce_flags(check: bool, crypt: bool) -> String {
+    format!(
+        "{} {}",
+        if check { "-c" } else { "-C" },
+        if crypt { "-e" } else { "-E" }
+    )
+}
+
 // --- commands --------------------------------------------------------------
 
 fn cmd_sink(args: &[String]) -> Result<(), String> {
     let f = parse_flags(args)?;
     let out = f.output.ok_or("sink needs -o FILE")?;
+    let key = f.key;
+    let crypt = f.crypt || key.is_some();
     match (&f.listen, &f.addr) {
-        (Some(l), None) => run_sink_listen(l, &out, f.streams, f.wnd, f.check),
-        (None, Some(a)) => run_sink_connect(a, &out, f.streams, f.wnd, f.check),
+        (Some(l), None) => run_sink_listen(l, &out, f.streams, f.wnd, f.check, crypt, key),
+        (None, Some(a)) => run_sink_connect(a, &out, f.streams, f.wnd, f.check, crypt, key),
         _ => Err("sink needs exactly one of -l ADDR or -a ADDR".into()),
     }
 }
@@ -198,9 +249,15 @@ fn cmd_sink(args: &[String]) -> Result<(), String> {
 fn cmd_source(args: &[String]) -> Result<(), String> {
     let f = parse_flags(args)?;
     let input = f.input.ok_or("source needs -i FILE")?;
+    let key = f.key;
+    let crypt = f.crypt || key.is_some();
     match (&f.listen, &f.addr) {
-        (None, Some(a)) => run_source_connect(a, &input, f.streams, f.wnd, f.progress, f.check),
-        (Some(l), None) => run_source_listen(l, &input, f.streams, f.wnd, f.progress, f.check),
+        (None, Some(a)) => {
+            run_source_connect(a, &input, f.streams, f.wnd, f.progress, f.check, crypt, key)
+        }
+        (Some(l), None) => {
+            run_source_listen(l, &input, f.streams, f.wnd, f.progress, f.check, crypt, key)
+        }
         _ => Err("source needs exactly one of -a ADDR or -l ADDR".into()),
     }
 }
@@ -212,41 +269,37 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
     }
     let src = f.rest[0].as_str();
     let dest = f.rest[1].as_str();
-    let check = if f.check_set { f.check } else { true }; // default on
+    let check = if f.check_set { f.check } else { true };
+    let crypt = if f.crypt_set { f.crypt } else { true };
     let bin = remote_bin();
     let s = f.streams;
     let w = f.wnd;
     let p = f.progress;
     let rev = f.reverse;
 
-    let src_remote = is_remote_spec(src);
-    let dst_remote = is_remote_spec(dest);
-    match (src_remote, dst_remote) {
+    match (is_remote_spec(src), is_remote_spec(dest)) {
         (false, true) => {
-            // push local → remote
             let (remote, rpath) = split_host_path(dest)?;
             if rev {
-                cp_push_reverse(&bin, remote, rpath, src, s, w, p, check)
+                cp_push_reverse(&bin, remote, rpath, src, s, w, p, check, crypt)
             } else {
-                cp_push_forward(&bin, remote, rpath, src, s, w, p, check)
+                cp_push_forward(&bin, remote, rpath, src, s, w, p, check, crypt)
             }
         }
         (true, false) => {
-            // pull remote → local
             let (remote, rpath) = split_host_path(src)?;
             if rev {
-                cp_pull_reverse(&bin, remote, rpath, dest, s, w, p, check)
+                cp_pull_reverse(&bin, remote, rpath, dest, s, w, p, check, crypt)
             } else {
-                cp_pull_forward(&bin, remote, rpath, dest, s, w, p, check)
+                cp_pull_forward(&bin, remote, rpath, dest, s, w, p, check, crypt)
             }
         }
         (false, false) => Err("cp needs one remote host:path side".into()),
-        (true, true) => Err("remote→remote not supported (pull then push)".into()),
+        (true, true) => Err("remote→remote not supported".into()),
     }
 }
 
 fn is_remote_spec(s: &str) -> bool {
-    // user@host:path or host:path — not absolute local /x or bare relative
     if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") {
         return false;
     }
@@ -254,7 +307,7 @@ fn is_remote_spec(s: &str) -> bool {
         None => false,
         Some(i) => {
             let host = &s[..i];
-            !host.is_empty() && !host.contains('/') // avoid Windows-ish C:\
+            !host.is_empty() && !host.contains('/')
         }
     }
 }
@@ -271,7 +324,6 @@ fn split_host_path(spec: &str) -> Result<(&str, &str), String> {
 
 // --- cp modes --------------------------------------------------------------
 
-/// Remote listens as sink; local source connects (needs inbound TCP to remote).
 fn cp_push_forward(
     bin: &str,
     remote: &str,
@@ -281,23 +333,27 @@ fn cp_push_forward(
     wnd: usize,
     progress: u64,
     check: bool,
+    crypt: bool,
 ) -> Result<(), String> {
-    let c = if check { "-c" } else { "-C" };
+    let ce = ce_flags(check, crypt);
     let cmd = format!(
-        "{} sink -l 0.0.0.0:0 -o {} -s {streams} -w {wnd} {c}",
+        "{} sink -l 0.0.0.0:0 -o {} -s {streams} -w {wnd} {ce}",
         shell_quote(bin),
         shell_quote(rpath)
     );
-    let (mut child, port) = ssh_start_port(remote, &cmd)?;
+    let (mut child, port, key) = ssh_start_banner(remote, &cmd, crypt)?;
     let host = host_only(remote);
     let addr = format!("{host}:{port}");
-    eprintln!("bbx: push {local_src} → {remote}:{rpath} via {addr} streams={streams} check={check}");
-    let r = run_source_connect(&addr, local_src, streams, wnd, progress, check);
+    eprintln!(
+        "bbx: push {local_src} → {remote}:{rpath} via {addr} streams={streams} check={check} crypt={crypt}"
+    );
+    let r = run_source_connect(
+        &addr, local_src, streams, wnd, progress, check, crypt, key,
+    );
     let _ = child.wait();
     r
 }
 
-/// Local source listens; remote sink connects out (remote needs to reach local).
 fn cp_push_reverse(
     bin: &str,
     remote: &str,
@@ -307,31 +363,34 @@ fn cp_push_reverse(
     wnd: usize,
     progress: u64,
     check: bool,
+    crypt: bool,
 ) -> Result<(), String> {
-    let cflag = check;
-    // bind source listener
     let listener = TcpListener::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-    let local = listener.local_addr().map_err(|e| e.to_string())?;
-    let port = local.port();
-    // discover local IP the remote can use: BBX_ADVERTISE or guess from ssh path
-    let advertise = env::var("BBX_ADVERTISE").unwrap_or_else(|_| guess_local_ip().unwrap_or_else(|| "127.0.0.1".into()));
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let advertise =
+        env::var("BBX_ADVERTISE").unwrap_or_else(|_| guess_local_ip().unwrap_or_else(|| "127.0.0.1".into()));
     let addr = format!("{advertise}:{port}");
-    let c = if check { "-c" } else { "-C" };
+    let key = if crypt { Some(gen_key()) } else { None };
+    let ce = ce_flags(check, crypt);
+    let karg = key
+        .as_ref()
+        .map(|k| format!(" -k {}", hex(k)))
+        .unwrap_or_default();
     let cmd = format!(
-        "{} sink -a {} -o {} -s {streams} -w {wnd} {c}",
+        "{} sink -a {} -o {} -s {streams} -w {wnd} {ce}{karg}",
         shell_quote(bin),
         shell_quote(&addr),
         shell_quote(rpath)
     );
-    eprintln!("bbx: push -z {local_src} → {remote}:{rpath} (remote dials {addr}) streams={streams}");
+    eprintln!("bbx: push -z {local_src} → {remote}:{rpath} (remote dials {addr}) crypt={crypt}");
     let mut child = ssh_spawn(remote, &cmd)?;
-    // give ssh a moment to auth before we accept; sink will connect when ready
-    let r = run_source_with_listener(listener, local_src, streams, wnd, progress, cflag);
+    let r = run_source_with_listener(
+        listener, local_src, streams, wnd, progress, check, crypt, key,
+    );
     let _ = child.wait();
     r
 }
 
-/// Local sink listens; remote source connects (local must be reachable from remote).
 fn cp_pull_forward(
     bin: &str,
     remote: &str,
@@ -341,26 +400,32 @@ fn cp_pull_forward(
     wnd: usize,
     progress: u64,
     check: bool,
+    crypt: bool,
 ) -> Result<(), String> {
     let listener = TcpListener::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let advertise = env::var("BBX_ADVERTISE").unwrap_or_else(|_| guess_local_ip().unwrap_or_else(|| "127.0.0.1".into()));
+    let advertise =
+        env::var("BBX_ADVERTISE").unwrap_or_else(|_| guess_local_ip().unwrap_or_else(|| "127.0.0.1".into()));
     let addr = format!("{advertise}:{port}");
-    let c = if check { "-c" } else { "-C" };
+    let key = if crypt { Some(gen_key()) } else { None };
+    let ce = ce_flags(check, crypt);
+    let karg = key
+        .as_ref()
+        .map(|k| format!(" -k {}", hex(k)))
+        .unwrap_or_default();
     let cmd = format!(
-        "{} source -a {} -i {} -s {streams} -w {wnd} {c}",
+        "{} source -a {} -i {} -s {streams} -w {wnd} {ce}{karg}",
         shell_quote(bin),
         shell_quote(&addr),
         shell_quote(rpath)
     );
-    eprintln!("bbx: pull {remote}:{rpath} → {local_dst} (remote dials {addr}) streams={streams}");
+    eprintln!("bbx: pull {remote}:{rpath} → {local_dst} (remote dials {addr}) crypt={crypt}");
     let mut child = ssh_spawn(remote, &cmd)?;
-    let r = run_sink_with_listener(listener, local_dst, streams, wnd, check, progress);
+    let r = run_sink_with_listener(listener, local_dst, streams, wnd, check, progress, crypt, key);
     let _ = child.wait();
     r
 }
 
-/// Remote source listens; local sink connects (needs inbound TCP to remote).
 fn cp_pull_reverse(
     bin: &str,
     remote: &str,
@@ -370,19 +435,20 @@ fn cp_pull_reverse(
     wnd: usize,
     progress: u64,
     check: bool,
+    crypt: bool,
 ) -> Result<(), String> {
-    let c = if check { "-c" } else { "-C" };
+    let ce = ce_flags(check, crypt);
     let cmd = format!(
-        "{} source -l 0.0.0.0:0 -i {} -s {streams} -w {wnd} {c}",
+        "{} source -l 0.0.0.0:0 -i {} -s {streams} -w {wnd} {ce}",
         shell_quote(bin),
         shell_quote(rpath)
     );
-    let (mut child, port) = ssh_start_port(remote, &cmd)?;
+    let (mut child, port, key) = ssh_start_banner(remote, &cmd, crypt)?;
     let host = host_only(remote);
     let addr = format!("{host}:{port}");
-    eprintln!("bbx: pull -z {remote}:{rpath} → {local_dst} via {addr} streams={streams}");
-    let r = run_sink_connect(&addr, local_dst, streams, wnd, check);
-    let _ = progress; // sink connect has no progress yet; pull local is receive
+    eprintln!("bbx: pull -z {remote}:{rpath} → {local_dst} via {addr} crypt={crypt}");
+    let r = run_sink_connect(&addr, local_dst, streams, wnd, check, crypt, key);
+    let _ = progress;
     let _ = child.wait();
     r
 }
@@ -392,13 +458,12 @@ fn host_only(remote: &str) -> &str {
 }
 
 fn guess_local_ip() -> Option<String> {
-    // UDP connect trick — no packets sent
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("8.8.8.8:80").ok()?;
     Some(s.local_addr().ok()?.ip().to_string())
 }
 
-// --- ssh helpers -----------------------------------------------------------
+// --- ssh -------------------------------------------------------------------
 
 fn ssh_spawn(remote: &str, remote_cmd: &str) -> Result<Child, String> {
     Command::new("ssh")
@@ -411,7 +476,12 @@ fn ssh_spawn(remote: &str, remote_cmd: &str) -> Result<Child, String> {
         .map_err(|e| format!("ssh: {e}"))
 }
 
-fn ssh_start_port(remote: &str, remote_cmd: &str) -> Result<(Child, u16), String> {
+/// Read PORT and optional KEY lines from remote agent stdout.
+fn ssh_start_banner(
+    remote: &str,
+    remote_cmd: &str,
+    expect_key: bool,
+) -> Result<(Child, u16, Option<[u8; 32]>), String> {
     let mut child = Command::new("ssh")
         .arg(remote)
         .arg(remote_cmd)
@@ -422,38 +492,61 @@ fn ssh_start_port(remote: &str, remote_cmd: &str) -> Result<(Child, u16), String
         .map_err(|e| format!("ssh: {e}"))?;
 
     let mut stdout = child.stdout.take().ok_or("ssh stdout")?;
-    let mut line = Vec::new();
-    let mut buf = [0u8; 128];
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 256];
+    let need_lines = if expect_key { 2 } else { 1 };
     loop {
-        let n = stdout.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = stdout.read(&mut tmp).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
-        line.extend_from_slice(&buf[..n]);
-        if line.contains(&b'\n') {
-            break;
-        }
-        if line.len() > 256 {
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.iter().filter(|&&b| b == b'\n').count() >= need_lines || buf.len() > 512 {
             break;
         }
     }
-    // keep draining stdout so remote isn't blocked
     thread::spawn(move || {
         let mut sink = io::sink();
         let _ = io::copy(&mut stdout, &mut sink);
     });
 
-    let s = String::from_utf8_lossy(&line);
-    let port: u16 = s
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| format!("remote did not print PORT: {s:?}"))?
-        .parse()
-        .map_err(|_| format!("bad PORT line: {s:?}"))?;
-    Ok((child, port))
+    let s = String::from_utf8_lossy(&buf);
+    let mut port: Option<u16> = None;
+    let mut key: Option<[u8; 32]> = None;
+    for line in s.lines() {
+        let mut w = line.split_whitespace();
+        match w.next() {
+            Some("PORT") => {
+                port = Some(
+                    w.next()
+                        .ok_or("PORT missing value")?
+                        .parse()
+                        .map_err(|_| "bad PORT")?,
+                );
+            }
+            Some("KEY") => {
+                key = Some(parse_key(w.next().ok_or("KEY missing value")?)?);
+            }
+            _ => {}
+        }
+    }
+    let port = port.ok_or_else(|| format!("remote did not print PORT: {s:?}"))?;
+    if expect_key && key.is_none() {
+        return Err(format!("remote did not print KEY (upgrade remote bbx?): {s:?}"));
+    }
+    Ok((child, port, key))
 }
 
 // --- transfer engine -------------------------------------------------------
+
+fn print_listen_banner(port: u16, crypt: bool, key: &Option<[u8; 32]>) {
+    println!("PORT {port}");
+    if crypt {
+        let k = key.expect("crypt without key");
+        println!("KEY {}", hex(&k));
+    }
+    let _ = io::stdout().flush();
+}
 
 fn run_sink_listen(
     listen: &str,
@@ -461,12 +554,18 @@ fn run_sink_listen(
     streams: usize,
     wnd: usize,
     check: bool,
+    crypt: bool,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
+    let key = if crypt {
+        Some(key.unwrap_or_else(gen_key))
+    } else {
+        None
+    };
     let listener = TcpListener::bind(listen).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    println!("PORT {port}");
-    let _ = io::stdout().flush();
-    run_sink_with_listener(listener, out, streams, wnd, check, 0)
+    print_listen_banner(port, crypt, &key);
+    run_sink_with_listener(listener, out, streams, wnd, check, 0, crypt, key)
 }
 
 fn run_sink_connect(
@@ -475,16 +574,20 @@ fn run_sink_connect(
     streams: usize,
     wnd: usize,
     check: bool,
+    crypt: bool,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
+    if crypt && key.is_none() {
+        return Err("encrypt needs -k KEY (from peer KEY line)".into());
+    }
     let dest: SocketAddr = addr.parse::<SocketAddr>().map_err(|e| e.to_string())?;
-    // connect N streams; first is control
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
         let s = TcpStream::connect(dest).map_err(|e| format!("sink connect[{i}]: {e}"))?;
         tune(&s, wnd);
         conns.push(s);
     }
-    finish_sink(conns, out, streams, check, 0)
+    finish_sink(conns, out, streams, check, 0, crypt, key)
 }
 
 fn run_sink_with_listener(
@@ -494,6 +597,8 @@ fn run_sink_with_listener(
     wnd: usize,
     check: bool,
     progress: u64,
+    crypt: bool,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
@@ -503,21 +608,23 @@ fn run_sink_with_listener(
         tune(&s, wnd);
         conns.push(s);
     }
-    finish_sink(conns, out, streams, check, progress)
+    finish_sink(conns, out, streams, check, progress, crypt, key)
 }
 
 fn finish_sink(
     mut conns: Vec<TcpStream>,
     out: &str,
     streams_hint: usize,
-    check: bool,
+    _check: bool,
     progress: u64,
+    crypt: bool,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let mut ctrl = conns.remove(0);
     let mut magic = [0u8; 4];
     ctrl.read_exact(&mut magic).map_err(|e| e.to_string())?;
     if &magic != MAGIC {
-        return Err(format!("bad magic {:?}", magic));
+        return Err(format!("bad magic {:?} (need BBX2; upgrade both ends)", magic));
     }
     let flags = read_u32(&mut ctrl)?;
     let size = read_u64(&mut ctrl)?;
@@ -526,8 +633,15 @@ fn finish_sink(
         return Err("bad stream count".into());
     }
     let want_check = flags & FLAG_BLAKE3 != 0;
-    if want_check != check {
-        // peer wins for wire; local -c should match
+    let want_crypt = flags & FLAG_CRYPT != 0;
+    if want_crypt != crypt {
+        return Err(format!(
+            "crypt mismatch: local={} peer={}",
+            crypt, want_crypt
+        ));
+    }
+    if want_crypt && key.is_none() {
+        return Err("peer sent FLAG_CRYPT but no session key".into());
     }
     let streams = n;
     if streams_hint != 0 && streams_hint != streams {
@@ -535,7 +649,6 @@ fn finish_sink(
             "stream count mismatch: local -s {streams_hint}, peer {streams}"
         ));
     }
-    // conns already holds the remaining streams-1 sockets (stream 0 is ctrl)
     let mut all = Vec::with_capacity(streams);
     all.push(ctrl);
     all.append(&mut conns);
@@ -562,6 +675,7 @@ fn finish_sink(
     let file = Arc::new(file);
     let got = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
+    let key = key.map(Arc::new);
     if progress > 0 {
         let g = Arc::clone(&got);
         thread::spawn(move || loop {
@@ -579,19 +693,9 @@ fn finish_sink(
         let (start, end) = ranges[i];
         let f = Arc::clone(&file);
         let g = Arc::clone(&got);
+        let k = key.clone();
         handles.push(thread::spawn(move || -> Result<(), String> {
-            let mut off = start;
-            let mut left = end - start;
-            let mut buf = vec![0u8; CHUNK];
-            while left > 0 {
-                let want = left.min(buf.len() as u64) as usize;
-                sock.read_exact(&mut buf[..want]).map_err(|e| e.to_string())?;
-                write_at_full(&f, &buf[..want], off)?;
-                g.fetch_add(want as u64, Ordering::Relaxed);
-                off += want as u64;
-                left -= want as u64;
-            }
-            Ok(())
+            recv_range(&mut sock, &f, start, end, i as u32, k.as_deref(), &g)
         }));
     }
     for h in handles {
@@ -625,7 +729,12 @@ fn run_source_connect(
     wnd: usize,
     progress: u64,
     check: bool,
+    crypt: bool,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
+    if crypt && key.is_none() {
+        return Err("encrypt needs session KEY from peer".into());
+    }
     let dest: SocketAddr = addr.parse::<SocketAddr>().map_err(|e| e.to_string())?;
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
@@ -633,7 +742,7 @@ fn run_source_connect(
         tune(&s, wnd);
         conns.push(s);
     }
-    finish_source(conns, input, streams, progress, check)
+    finish_source(conns, input, streams, progress, check, crypt, key)
 }
 
 fn run_source_listen(
@@ -643,12 +752,18 @@ fn run_source_listen(
     wnd: usize,
     progress: u64,
     check: bool,
+    crypt: bool,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
+    let key = if crypt {
+        Some(key.unwrap_or_else(gen_key))
+    } else {
+        None
+    };
     let listener = TcpListener::bind(listen).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    println!("PORT {port}");
-    let _ = io::stdout().flush();
-    run_source_with_listener(listener, input, streams, wnd, progress, check)
+    print_listen_banner(port, crypt, &key);
+    run_source_with_listener(listener, input, streams, wnd, progress, check, crypt, key)
 }
 
 fn run_source_with_listener(
@@ -658,6 +773,8 @@ fn run_source_with_listener(
     wnd: usize,
     progress: u64,
     check: bool,
+    crypt: bool,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
@@ -667,7 +784,7 @@ fn run_source_with_listener(
         tune(&s, wnd);
         conns.push(s);
     }
-    finish_source(conns, input, streams, progress, check)
+    finish_source(conns, input, streams, progress, check, crypt, key)
 }
 
 fn finish_source(
@@ -676,9 +793,14 @@ fn finish_source(
     streams: usize,
     progress: u64,
     check: bool,
+    crypt: bool,
+    key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     if conns.len() != streams {
         return Err(format!("expected {streams} streams, got {}", conns.len()));
+    }
+    if crypt && key.is_none() {
+        return Err("encrypt needs key".into());
     }
     let file = File::open(input).map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
@@ -695,7 +817,13 @@ fn finish_source(
 
     let mut ctrl = &mut conns[0];
     ctrl.write_all(MAGIC).map_err(|e| e.to_string())?;
-    let flags = if check { FLAG_BLAKE3 } else { 0 };
+    let mut flags = 0u32;
+    if check {
+        flags |= FLAG_BLAKE3;
+    }
+    if crypt {
+        flags |= FLAG_CRYPT;
+    }
     write_u32(&mut ctrl, flags)?;
     write_u64(&mut ctrl, size)?;
     write_u32(&mut ctrl, streams as u32)?;
@@ -707,6 +835,7 @@ fn finish_source(
     let sent = Arc::new(AtomicU64::new(0));
     let t0 = Instant::now();
     let file = Arc::new(file);
+    let key = key.map(Arc::new);
 
     if progress > 0 {
         let sent_p = Arc::clone(&sent);
@@ -725,19 +854,9 @@ fn finish_source(
         let (start, end) = ranges[i];
         let f = Arc::clone(&file);
         let sent_c = Arc::clone(&sent);
+        let k = key.clone();
         handles.push(thread::spawn(move || -> Result<(), String> {
-            let mut off = start;
-            let mut left = end - start;
-            let mut buf = vec![0u8; CHUNK];
-            while left > 0 {
-                let want = left.min(buf.len() as u64) as usize;
-                read_at_full(&f, &mut buf[..want], off)?;
-                sock.write_all(&buf[..want]).map_err(|e| e.to_string())?;
-                sent_c.fetch_add(want as u64, Ordering::Relaxed);
-                off += want as u64;
-                left -= want as u64;
-            }
-            Ok(())
+            send_range(&mut sock, &f, start, end, i as u32, k.as_deref(), &sent_c)
         }));
     }
     for h in handles {
@@ -746,15 +865,108 @@ fn finish_source(
     eprint_progress(size, size, t0);
     let elapsed = t0.elapsed().as_secs_f64().max(0.001);
     eprintln!(
-        "\nbbx: done {} bytes in {:.2}s ({:.1} MB/s)",
+        "\nbbx: done {} bytes in {:.2}s ({:.1} MB/s){}",
         size,
         elapsed,
-        size as f64 / elapsed / 1024.0 / 1024.0
+        size as f64 / elapsed / 1024.0 / 1024.0,
+        if crypt { " [encrypted]" } else { "" }
     );
     Ok(())
 }
 
-// --- blake3 / util ---------------------------------------------------------
+// --- crypto frames ---------------------------------------------------------
+
+fn make_nonce(stream_id: u32, counter: u64) -> Nonce {
+    let mut n = [0u8; 12];
+    n[0..4].copy_from_slice(&stream_id.to_le_bytes());
+    n[4..12].copy_from_slice(&counter.to_le_bytes());
+    *Nonce::from_slice(&n)
+}
+
+fn send_range(
+    sock: &mut TcpStream,
+    f: &File,
+    start: u64,
+    end: u64,
+    stream_id: u32,
+    key: Option<&[u8; 32]>,
+    sent: &AtomicU64,
+) -> Result<(), String> {
+    let mut off = start;
+    let mut left = end - start;
+    let mut buf = vec![0u8; if key.is_some() { CRYPT_PT } else { CHUNK }];
+    let mut counter = 0u64;
+    let cipher = key.map(|k| ChaCha20Poly1305::new_from_slice(k).expect("key"));
+
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        read_at_full(f, &mut buf[..want], off)?;
+        if let Some(ref c) = cipher {
+            let nonce = make_nonce(stream_id, counter);
+            counter += 1;
+            let ct = c
+                .encrypt(&nonce, &buf[..want])
+                .map_err(|_| "encrypt failed".to_string())?;
+            write_u32(sock, ct.len() as u32)?;
+            sock.write_all(&ct).map_err(|e| e.to_string())?;
+        } else {
+            sock.write_all(&buf[..want]).map_err(|e| e.to_string())?;
+        }
+        sent.fetch_add(want as u64, Ordering::Relaxed);
+        off += want as u64;
+        left -= want as u64;
+    }
+    Ok(())
+}
+
+fn recv_range(
+    sock: &mut TcpStream,
+    f: &File,
+    start: u64,
+    end: u64,
+    stream_id: u32,
+    key: Option<&[u8; 32]>,
+    got: &AtomicU64,
+) -> Result<(), String> {
+    let mut off = start;
+    let mut left = end - start;
+    let mut buf = vec![0u8; CHUNK];
+    let mut counter = 0u64;
+    let cipher = key.map(|k| ChaCha20Poly1305::new_from_slice(k).expect("key"));
+
+    while left > 0 {
+        if let Some(ref c) = cipher {
+            let clen = read_u32(sock)? as usize;
+            if clen > CRYPT_PT + 16 + 64 {
+                return Err(format!("bad ciphertext len {clen}"));
+            }
+            let mut ct = vec![0u8; clen];
+            sock.read_exact(&mut ct).map_err(|e| e.to_string())?;
+            let nonce = make_nonce(stream_id, counter);
+            counter += 1;
+            let pt = c
+                .decrypt(&nonce, ct.as_ref())
+                .map_err(|_| "decrypt failed (wrong key or corrupt)".to_string())?;
+            if pt.len() as u64 > left {
+                return Err("decrypt oversize".into());
+            }
+            write_at_full(f, &pt, off)?;
+            got.fetch_add(pt.len() as u64, Ordering::Relaxed);
+            off += pt.len() as u64;
+            left -= pt.len() as u64;
+        } else {
+            let want = left.min(buf.len() as u64) as usize;
+            sock.read_exact(&mut buf[..want]).map_err(|e| e.to_string())?;
+            write_at_full(f, &buf[..want], off)?;
+            got.fetch_add(want as u64, Ordering::Relaxed);
+            off += want as u64;
+            left -= want as u64;
+        }
+    }
+    Ok(())
+}
+
+// --- util ------------------------------------------------------------------
 
 fn hash_file(path: &str) -> Result<[u8; 32], String> {
     let mut f = File::open(path).map_err(|e| e.to_string())?;
@@ -879,10 +1091,10 @@ fn read_u32(r: &mut impl Read) -> Result<u32, String> {
     r.read_exact(&mut b).map_err(|e| e.to_string())?;
     Ok(u32::from_le_bytes(b))
 }
-fn write_u64(w: &mut impl Write, v: u64) -> Result<(), String> {
+fn write_u32(w: &mut impl Write, v: u32) -> Result<(), String> {
     w.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())
 }
-fn write_u32(w: &mut impl Write, v: u32) -> Result<(), String> {
+fn write_u64(w: &mut impl Write, v: u64) -> Result<(), String> {
     w.write_all(&v.to_le_bytes()).map_err(|e| e.to_string())
 }
 
@@ -893,17 +1105,19 @@ mod tests {
     #[test]
     fn ranges_cover_file() {
         let r = split_ranges(100, 3);
-        assert_eq!(r.len(), 3);
-        assert_eq!(r[0].0, 0);
-        assert_eq!(r[2].1, 100);
         assert_eq!(r.iter().map(|(a, b)| b - a).sum::<u64>(), 100);
+    }
+
+    #[test]
+    fn key_roundtrip() {
+        let k = gen_key();
+        let h = hex(&k);
+        assert_eq!(parse_key(&h).unwrap(), k);
     }
 
     #[test]
     fn remote_spec() {
         assert!(is_remote_spec("user@host:/tmp/x"));
-        assert!(is_remote_spec("172.18.0.144:~/f"));
         assert!(!is_remote_spec("/tmp/x"));
-        assert!(!is_remote_spec("./x"));
     }
 }

@@ -1,82 +1,71 @@
 # bbx
 
-Multi-stream bulk file copy. **Open BBX2 protocol**, BLAKE3 verify, push/pull/reverse.
+Multi-stream bulk file copy in Rust.
+
+**BBX2** open protocol · **BLAKE3** verify · **ChaCha20-Poly1305** data plane · push/pull/reverse.
 
 Not wire-compatible with [bbcp](https://www.slac.stanford.edu/~abh/bbcp/).
-
-## Why bbx (vs bbcp)
-
-| | bbcp | bbx |
-|--|------|-----|
-| Protocol | tribal / C++ only | [SPEC.md](SPEC.md) |
-| Integrity | optional legacy hashes | **BLAKE3 default** on `cp` |
-| Direction | mostly push-shaped | **push + pull** |
-| NAT | obscure `-z` | **`-z` reverse** + `BBX_ADVERTISE` |
-| Build | multi-OS makefile | `cargo build --release` |
 
 ## Install
 
 ```sh
-cargo build --release
-# binary: target/release/bbx
-# copy same binary to remote (or cargo build there)
+# from clone
+cargo install --path .
+
+# after crates.io publish
+# cargo install bbx
 ```
 
-## Usage
+Binary: `~/.cargo/bin/bbx` (or `target/release/bbx`). **Same version on both hosts.**
 
-### Local (no ssh)
-
-```sh
-bbx sink -l 127.0.0.1:0 -o /tmp/out -s 4 -c   # prints PORT n
-bbx source -a 127.0.0.1:n -i /tmp/in -s 4 -c -P 1
-```
-
-### Push (local → remote)
-
-Needs **inbound TCP to remote** data port (or use `-z`).
+## Quick remote push
 
 ```sh
 export BBX_REMOTE=/path/to/bbx   # on remote
 bbx cp -s 8 -P 5 big.bin user@host:~/big.bin
+# defaults: BLAKE3 + encrypt on
 ```
 
-### Push reverse (`-z`) — remote dials you
+Disable: `-C` (no checksum), `-E` (cleartext).
 
-Remote must reach your IP (`BBX_ADVERTISE` if guess is wrong).
+## Modes
 
-```sh
-export BBX_REMOTE=/path/to/bbx
-export BBX_ADVERTISE=10.0.0.5    # your address as seen by remote
-bbx cp -z -s 8 -P 5 big.bin user@host:~/big.bin
-```
+| | Command |
+|--|---------|
+| Push | `bbx cp local user@host:path` |
+| Pull | `bbx cp user@host:path local` |
+| Reverse | add `-z` + `BBX_ADVERTISE=your.ip` |
 
-### Pull (remote → local)
-
-```sh
-export BBX_REMOTE=/path/to/bbx
-export BBX_ADVERTISE=10.0.0.5
-bbx cp -s 8 -P 5 user@host:~/big.bin ./big.bin
-```
-
-### Flags
+## Flags
 
 | Flag | Meaning |
 |------|---------|
 | `-s N` | streams (default 4) |
-| `-w SIZE` | socket buffer hint (`4M`, …) |
-| `-P SEC` | progress refresh |
-| `-c` / `-C` | BLAKE3 on / off (`cp` defaults **on**) |
-| `-z` | reverse dial direction |
+| `-w SIZE` | socket buffer hint |
+| `-P SEC` | progress |
+| `-c` / `-C` | BLAKE3 on/off (`cp` default on) |
+| `-e` / `-E` | encrypt on/off (`cp` default on) |
+| `-z` | reverse dial |
+| `-k HEX` | session key (agents; usually automatic) |
+
+## Why not bbcp
+
+| | bbcp | bbx |
+|--|------|-----|
+| Protocol | closed C++ | [SPEC.md](SPEC.md) |
+| Data plane | often cleartext | **AEAD default** |
+| Direction | awkward | push + pull + `-z` |
+| Build | makefile zoo | `cargo install` |
+
+## Status
+
+- [x] P0 multi-stream, push/pull, reverse, BLAKE3, SPEC, CI  
+- [x] **P1** encrypted data plane, install metadata  
+- [ ] P2 resume, JSON progress, benches  
 
 ## Security
 
-Data path is **plain TCP**. SSH only starts the remote agent. Use trusted LAN/VPN or wrap later (P1: encrypt).
-
-## Status (roadmap)
-
-- [x] **P0** multi-stream, push/pull, reverse, BLAKE3, SPEC, CI  
-- [ ] **P1** encrypted data plane / QUIC, `cargo install` polish  
-- [ ] **P2** resume, JSON progress, benches  
+Session key is established over SSH (banner or `-k`). Data sockets use ChaCha20-Poly1305 when `-e`. See SPEC threat model.
 
 ## License
 

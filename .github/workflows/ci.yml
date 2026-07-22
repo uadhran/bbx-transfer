@@ -15,25 +15,27 @@ jobs:
         run: cargo test --all
       - name: build release
         run: cargo build --release
-      - name: smoke transfer + blake3
+      - name: smoke cleartext + encrypted
         run: |
           set -euo pipefail
           BIN=./target/release/bbx
           dd if=/dev/urandom of=/tmp/bbx-in.bin bs=1M count=8 status=none
+          # cleartext
           rm -f /tmp/bbx-out.bin /tmp/bbx-port.txt
-          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-out.bin -s 4 -c > /tmp/bbx-port.txt &
+          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-out.bin -s 4 -c -E > /tmp/bbx-port.txt &
           SPID=$!
           for i in $(seq 1 50); do test -s /tmp/bbx-port.txt && break; sleep 0.05; done
-          PORT=$(awk '{print $2}' /tmp/bbx-port.txt)
-          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -c -P 1
+          PORT=$(awk '/^PORT/{print $2; exit}' /tmp/bbx-port.txt)
+          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -c -E -P 1
           wait $SPID
           cmp /tmp/bbx-in.bin /tmp/bbx-out.bin
-          # reverse smoke
-          rm -f /tmp/bbx-out2.bin
-          $BIN source -l 127.0.0.1:0 -i /tmp/bbx-in.bin -s 2 -c > /tmp/bbx-port2.txt &
+          # encrypted (KEY banner)
+          rm -f /tmp/bbx-out2.bin /tmp/bbx-port2.txt
+          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-out2.bin -s 4 -c -e > /tmp/bbx-port2.txt &
           SPID=$!
-          for i in $(seq 1 50); do test -s /tmp/bbx-port2.txt && break; sleep 0.05; done
-          PORT=$(awk '{print $2}' /tmp/bbx-port2.txt)
-          $BIN sink -a "127.0.0.1:$PORT" -o /tmp/bbx-out2.bin -s 2 -c
+          for i in $(seq 1 50); do grep -q '^KEY ' /tmp/bbx-port2.txt 2>/dev/null && break; sleep 0.05; done
+          PORT=$(awk '/^PORT/{print $2; exit}' /tmp/bbx-port2.txt)
+          KEY=$(awk '/^KEY /{print $2; exit}' /tmp/bbx-port2.txt)
+          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -c -e -k "$KEY" -P 1
           wait $SPID
           cmp /tmp/bbx-in.bin /tmp/bbx-out2.bin
