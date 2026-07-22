@@ -79,16 +79,32 @@ bbx source -a 127.0.0.1:PORT -i file -J -P 1
 
 ## Status / roadmap
 
-**Shipped P0–P3.** Open work and future ideas live in **[ROADMAP.md](ROADMAP.md)** (contributor-friendly: C1–C10 open, F1–F8 future).
+**Shipped P0–P4.** Open work and future ideas live in **[ROADMAP.md](ROADMAP.md)** (contributor-friendly open items C2–C12, F1–F8 future).
 
 ```sh
 ./scripts/bench-local.sh   # loopback multi-stream timing
 bbx cp -r ./mydir user@host:~/mydir
 ```
 
+## Reliability
+
+Data sockets, connect, and `accept()` are all bounded by a timeout (default 120s,
+override with `BBX_IO_TIMEOUT_SECS`), and one failing stream aborts the rest — a
+stalled or dead peer fails the transfer instead of hanging.
+
 ## Security
 
-Session key is established over SSH (banner or `-k`). Data sockets use ChaCha20-Poly1305 when `-e`. See SPEC threat model.
+Session key is established over SSH: the listener prints it in the `KEY` banner, or
+the dial-out side passes it to the remote via the `BBX_KEY` environment variable —
+never `-k` on the remote's argv, so it isn't exposed to a plain `ps`. Data sockets
+use ChaCha20-Poly1305 when `-e`. See [SPEC threat model](SPEC.md#threat-model).
+
+## Limitations
+
+- Verification is negotiated by the **source**: the sink verifies iff the source
+  sent a BLAKE3 hash, so the sink's own `-c`/`-C` is advisory (C12).
+- IPv6 `host:path` specs (`[::1]:path`) aren't parsed yet (C11).
+- `-r` runs one session per file — simple, but chatty for many small files.
 
 ## License
 

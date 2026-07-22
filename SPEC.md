@@ -72,10 +72,19 @@ RESUME <u64>          # only if sink -A (existing dest length)
 
 ## Threat model
 
-- **SSH** authenticates agent start and can carry the session PSK (banner / argv).
+- **SSH** authenticates agent start and can carry the session PSK (banner / `BBX_KEY` env).
 - **Data plane** with `-e`: confidentiality + integrity of payload (AEAD).
 - **Without `-e`**: cleartext TCP (trusted network only).
-- PSK on process argv (`-k`) is visible to local `ps` — acceptable for lab; prefer banner KEY on listener path.
+- The session PSK reaches the remote via the banner `KEY` line (listener path) or a
+  `BBX_KEY=` environment assignment (dial-out path) — **never** `-k` on argv, so it
+  is not exposed to a plain remote `ps`. `-k` remains accepted for manual use.
+- BLAKE3 hash still travels cleartext on stream 0 even under `-e` (see F8).
+
+## Liveness
+
+- Data sockets have a read/write timeout; connect and `accept()` are bounded too
+  (default 120s, override with `BBX_IO_TIMEOUT_SECS`). A stalled or dead peer fails
+  the transfer instead of hanging, and a failing stream aborts its siblings.
 
 ## Versioning
 
