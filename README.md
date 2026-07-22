@@ -49,6 +49,7 @@ Disable: `-C` (no checksum), `-E` (cleartext).
 | `-A` | **resume** partial destination |
 | `-R N` | source: resume from byte offset N |
 | `-J` | **JSON** progress lines on stdout |
+| `-r` | **recursive** directory trees (one session per file) |
 | `-z` | reverse dial |
 | `-k HEX` | session key (agents; usually automatic) |
 
@@ -76,14 +77,13 @@ bbx source -a 127.0.0.1:PORT -i file -J -P 1
 | Direction | awkward | push + pull + `-z` |
 | Build | makefile zoo | `cargo install` |
 
-## Status
+## Status / roadmap
 
-- [x] P0 multi-stream, push/pull, reverse, BLAKE3, SPEC, CI  
-- [x] P1 encrypted data plane, install metadata  
-- [x] **P2** resume (`-A`), JSON (`-J`), local bench script  
+**Shipped P0–P3.** Open work and future ideas live in **[ROADMAP.md](ROADMAP.md)** (contributor-friendly: C1–C10 open, F1–F8 future).
 
 ```sh
 ./scripts/bench-local.sh   # loopback multi-stream timing
+bbx cp -r ./mydir user@host:~/mydir
 ```
 
 ## Security

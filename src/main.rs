@@ -56,7 +56,7 @@ fn usage(code: i32) {
         "bbx — multi-stream bulk copy (BBX2)\n\n\
          bbx sink|source|cp …\n\
          opts: -s N -w SIZE -P SEC -c|-C -e|-E -k HEX\n\
-               -A resume  -J json progress  -R BYTES (source resume offset)\n\
+               -A resume  -J json  -r recurse dirs  -R BYTES\n\
                -z reverse\n\
          cp defaults: -c -e on. -A resumes partial dest.\n\
          BBX_REMOTE=  BBX_ADVERTISE=\n"
@@ -84,6 +84,7 @@ struct Flags {
     resume: bool,
     resume_from: u64,
     json: bool,
+    recurse: bool,
     rest: Vec<String>,
 }
 
@@ -105,6 +106,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         resume: false,
         resume_from: 0,
         json: false,
+        recurse: false,
         rest: Vec::new(),
     };
     let mut i = 0;
@@ -168,6 +170,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
             "-z" => f.reverse = true,
             "-A" => f.resume = true,
             "-J" => f.json = true,
+            "-r" => f.recurse = true,
             "-R" => {
                 i += 1;
                 f.resume_from = need(args, i, "-R")?
@@ -299,11 +302,14 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
     let rev = f.reverse;
     let resume = f.resume;
     let json = f.json;
+    let recurse = f.recurse;
 
     match (is_remote_spec(src), is_remote_spec(dest)) {
         (false, true) => {
             let (remote, rpath) = split_host_path(dest)?;
-            if rev {
+            if recurse {
+                cp_push_tree(&bin, remote, rpath, src, s, w, p, check, crypt, resume, json, rev)
+            } else if rev {
                 cp_push_reverse(&bin, remote, rpath, src, s, w, p, check, crypt, resume, json)
             } else {
                 cp_push_forward(&bin, remote, rpath, src, s, w, p, check, crypt, resume, json)
@@ -311,7 +317,9 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
         }
         (true, false) => {
             let (remote, rpath) = split_host_path(src)?;
-            if rev {
+            if recurse {
+                cp_pull_tree(&bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, rev)
+            } else if rev {
                 cp_pull_reverse(&bin, remote, rpath, dest, s, w, p, check, crypt, resume, json)
             } else {
                 cp_pull_forward(&bin, remote, rpath, dest, s, w, p, check, crypt, resume, json)
@@ -343,6 +351,225 @@ fn split_host_path(spec: &str) -> Result<(&str, &str), String> {
         return Err("bad host:path".into());
     }
     Ok((host, path))
+}
+
+
+// --- tree walk (P3 -r) -----------------------------------------------------
+
+fn walk_local_files(root: &std::path::Path) -> Result<Vec<(std::path::PathBuf, String)>, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("src: {e}"))?;
+    if !root.is_dir() {
+        return Err(" -r needs a source directory".into());
+    }
+    let mut out = Vec::new();
+    walk_local_rec(&root, &root, &mut out)?;
+    out.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(out)
+}
+
+fn walk_local_rec(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    out: &mut Vec<(std::path::PathBuf, String)>,
+) -> Result<(), String> {
+    for ent in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let ent = ent.map_err(|e| e.to_string())?;
+        let path = ent.path();
+        let ft = ent.file_type().map_err(|e| e.to_string())?;
+        if ft.is_dir() {
+            walk_local_rec(base, &path, out)?;
+        } else if ft.is_file() {
+            let rel = path
+                .strip_prefix(base)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((path, rel));
+        }
+        // skip symlinks for now
+    }
+    Ok(())
+}
+
+fn remote_list_files(remote: &str, rpath: &str) -> Result<Vec<String>, String> {
+    // relative paths under rpath
+    let out = Command::new("ssh")
+        .arg(remote)
+        .arg(format!(
+            "cd {} && find . -type f | sed 's|^\\./||'",
+            shell_quote(rpath)
+        ))
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("ssh find: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "remote find failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+fn ssh_mkdir_p(remote: &str, dir: &str) -> Result<(), String> {
+    let st = Command::new("ssh")
+        .arg(remote)
+        .arg(format!("mkdir -p {}", shell_quote(dir)))
+        .stdin(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("ssh mkdir: {e}"))?;
+    if !st.success() {
+        return Err(format!("mkdir -p failed for {dir}"));
+    }
+    Ok(())
+}
+
+fn join_remote(base: &str, rel: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if rel.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+fn parent_posix(path: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    path.rfind('/').map(|i| path[..i].to_string())
+}
+
+/// Sequential multi-file push (one BBX2 session per file). Clear, correct, not fancy.
+fn cp_push_tree(
+    bin: &str,
+    remote: &str,
+    rpath: &str,
+    local_src: &str,
+    streams: usize,
+    wnd: usize,
+    progress: u64,
+    check: bool,
+    crypt: bool,
+    resume: bool,
+    json: bool,
+    rev: bool,
+) -> Result<(), String> {
+    let root = std::path::Path::new(local_src);
+    let files = walk_local_files(root)?;
+    if files.is_empty() {
+        return Err("no files under source directory".into());
+    }
+    ssh_mkdir_p(remote, rpath)?;
+    if !json {
+        eprintln!("bbx: push -r {} files → {}:{rpath}", files.len(), remote);
+    }
+    for (i, (local, rel)) in files.iter().enumerate() {
+        let remote_file = join_remote(rpath, rel);
+        if let Some(parent) = parent_posix(&remote_file) {
+            ssh_mkdir_p(remote, &parent)?;
+        }
+        if !json {
+            eprintln!("bbx: [{}/{}] {}", i + 1, files.len(), rel);
+        } else {
+            println!(
+                r#"{{"event":"file","index":{},"total":{},"path":{:?}}}"#,
+                i + 1,
+                files.len(),
+                rel
+            );
+        }
+        let local_s = local.to_string_lossy();
+        if rev {
+            cp_push_reverse(
+                bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
+                resume, json,
+            )?;
+        } else {
+            cp_push_forward(
+                bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
+                resume, json,
+            )?;
+        }
+    }
+    if json {
+        println!(
+            r#"{{"event":"tree_done","files":{},"direction":"push"}}"#,
+            files.len()
+        );
+    } else {
+        eprintln!("bbx: tree push done ({} files)", files.len());
+    }
+    Ok(())
+}
+
+fn cp_pull_tree(
+    bin: &str,
+    remote: &str,
+    rpath: &str,
+    local_dst: &str,
+    streams: usize,
+    wnd: usize,
+    progress: u64,
+    check: bool,
+    crypt: bool,
+    resume: bool,
+    json: bool,
+    rev: bool,
+) -> Result<(), String> {
+    let files = remote_list_files(remote, rpath)?;
+    if files.is_empty() {
+        return Err("no remote files found (need GNU find -printf or plain find)".into());
+    }
+    std::fs::create_dir_all(local_dst).map_err(|e| e.to_string())?;
+    if !json {
+        eprintln!("bbx: pull -r {} files from {}:{rpath}", files.len(), remote);
+    }
+    for (i, rel) in files.iter().enumerate() {
+        let remote_file = join_remote(rpath, rel);
+        let local_file = std::path::Path::new(local_dst).join(rel);
+        if let Some(parent) = local_file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if !json {
+            eprintln!("bbx: [{}/{}] {}", i + 1, files.len(), rel);
+        } else {
+            println!(
+                r#"{{"event":"file","index":{},"total":{},"path":{:?}}}"#,
+                i + 1,
+                files.len(),
+                rel
+            );
+        }
+        let local_s = local_file.to_string_lossy();
+        if rev {
+            cp_pull_reverse(
+                bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
+                resume, json,
+            )?;
+        } else {
+            cp_pull_forward(
+                bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
+                resume, json,
+            )?;
+        }
+    }
+    if json {
+        println!(
+            r#"{{"event":"tree_done","files":{},"direction":"pull"}}"#,
+            files.len()
+        );
+    } else {
+        eprintln!("bbx: tree pull done ({} files)", files.len());
+    }
+    Ok(())
 }
 
 // --- cp modes --------------------------------------------------------------
@@ -1336,5 +1563,19 @@ mod tests {
     fn remote_spec() {
         assert!(is_remote_spec("user@host:/tmp/x"));
         assert!(!is_remote_spec("/tmp/x"));
+    }
+
+    #[test]
+    fn walk_lists_nested_files() {
+        let dir = std::env::temp_dir().join(format!("bbx_walk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/c.txt"), b"hi").unwrap();
+        std::fs::write(dir.join("root.bin"), b"x").unwrap();
+        let files = walk_local_files(&dir).unwrap();
+        let rels: Vec<_> = files.iter().map(|(_, r)| r.as_str()).collect();
+        assert!(rels.contains(&"a/b/c.txt") || rels.iter().any(|r| r.ends_with("c.txt")));
+        assert!(rels.iter().any(|r| r.ends_with("root.bin")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
