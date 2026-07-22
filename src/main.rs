@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::FileExt;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +24,12 @@ const CRYPT_PT: usize = 64 * 1024;
 const FLAG_BLAKE3: u32 = 1;
 const FLAG_CRYPT: u32 = 2;
 const FLAG_RESUME: u32 = 4;
+
+// A stalled-but-open peer must not hang the transfer forever. Data sockets get
+// a read/write timeout (overridable via BBX_IO_TIMEOUT_SECS for tests), and
+// connection establishment is bounded separately.
+const IO_TIMEOUT_SECS: u64 = 120;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -962,7 +968,8 @@ fn run_sink_connect(
     let dest: SocketAddr = addr.parse::<SocketAddr>().map_err(|e| e.to_string())?;
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
-        let s = TcpStream::connect(dest).map_err(|e| format!("sink connect[{i}]: {e}"))?;
+        let s = TcpStream::connect_timeout(&dest, CONNECT_TIMEOUT)
+            .map_err(|e| format!("sink connect[{i}]: {e}"))?;
         tune(&s, wnd);
         conns.push(s);
     }
@@ -1096,14 +1103,20 @@ fn finish_sink(
         });
     }
 
+    let abort = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     for (i, mut sock) in all.into_iter().enumerate() {
         let (start, end) = ranges[i];
         let f = Arc::clone(&file);
         let g = Arc::clone(&got);
         let k = key.clone();
+        let ab = Arc::clone(&abort);
         handles.push(thread::spawn(move || -> Result<(), String> {
-            recv_range(&mut sock, &f, start, end, i as u32, k.as_deref(), &g)
+            let r = recv_range(&mut sock, &f, start, end, i as u32, k.as_deref(), &g, &ab);
+            if r.is_err() {
+                ab.store(true, Ordering::Relaxed);
+            }
+            r
         }));
     }
     for h in handles {
@@ -1159,7 +1172,8 @@ fn run_source_connect(
     let dest: SocketAddr = addr.parse::<SocketAddr>().map_err(|e| e.to_string())?;
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
-        let s = TcpStream::connect(dest).map_err(|e| format!("source connect[{i}]: {e}"))?;
+        let s = TcpStream::connect_timeout(&dest, CONNECT_TIMEOUT)
+            .map_err(|e| format!("source connect[{i}]: {e}"))?;
         tune(&s, wnd);
         conns.push(s);
     }
@@ -1306,14 +1320,20 @@ fn finish_source(
         });
     }
 
+    let abort = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     for (i, mut sock) in conns.into_iter().enumerate() {
         let (start, end) = ranges[i];
         let f = Arc::clone(&file);
         let sent_c = Arc::clone(&sent);
         let k = key.clone();
+        let ab = Arc::clone(&abort);
         handles.push(thread::spawn(move || -> Result<(), String> {
-            send_range(&mut sock, &f, start, end, i as u32, k.as_deref(), &sent_c)
+            let r = send_range(&mut sock, &f, start, end, i as u32, k.as_deref(), &sent_c, &ab);
+            if r.is_err() {
+                ab.store(true, Ordering::Relaxed);
+            }
+            r
         }));
     }
     for h in handles {
@@ -1360,6 +1380,7 @@ fn send_range(
     stream_id: u32,
     key: Option<&[u8; 32]>,
     sent: &AtomicU64,
+    abort: &AtomicBool,
 ) -> Result<(), String> {
     let mut off = start;
     let mut left = end - start;
@@ -1368,6 +1389,9 @@ fn send_range(
     let cipher = key.map(|k| ChaCha20Poly1305::new_from_slice(k).expect("key"));
 
     while left > 0 {
+        if abort.load(Ordering::Relaxed) {
+            return Err(format!("stream {stream_id} aborted (peer stream failed)"));
+        }
         let want = left.min(buf.len() as u64) as usize;
         read_at_full(f, &mut buf[..want], off)?;
         if let Some(ref c) = cipher {
@@ -1376,10 +1400,11 @@ fn send_range(
             let ct = c
                 .encrypt(&nonce, &buf[..want])
                 .map_err(|_| "encrypt failed".to_string())?;
-            write_u32(sock, ct.len() as u32)?;
-            sock.write_all(&ct).map_err(|e| e.to_string())?;
+            write_u32(sock, ct.len() as u32).map_err(|e| io_err(stream_id, "write", e))?;
+            sock.write_all(&ct).map_err(|e| io_err(stream_id, "write", e.to_string()))?;
         } else {
-            sock.write_all(&buf[..want]).map_err(|e| e.to_string())?;
+            sock.write_all(&buf[..want])
+                .map_err(|e| io_err(stream_id, "write", e.to_string()))?;
         }
         sent.fetch_add(want as u64, Ordering::Relaxed);
         off += want as u64;
@@ -1396,6 +1421,7 @@ fn recv_range(
     stream_id: u32,
     key: Option<&[u8; 32]>,
     got: &AtomicU64,
+    abort: &AtomicBool,
 ) -> Result<(), String> {
     let mut off = start;
     let mut left = end - start;
@@ -1404,13 +1430,17 @@ fn recv_range(
     let cipher = key.map(|k| ChaCha20Poly1305::new_from_slice(k).expect("key"));
 
     while left > 0 {
+        if abort.load(Ordering::Relaxed) {
+            return Err(format!("stream {stream_id} aborted (peer stream failed)"));
+        }
         if let Some(ref c) = cipher {
-            let clen = read_u32(sock)? as usize;
+            let clen = read_u32(sock).map_err(|e| io_err(stream_id, "read", e))? as usize;
             if clen > CRYPT_PT + 16 + 64 {
                 return Err(format!("bad ciphertext len {clen}"));
             }
             let mut ct = vec![0u8; clen];
-            sock.read_exact(&mut ct).map_err(|e| e.to_string())?;
+            sock.read_exact(&mut ct)
+                .map_err(|e| io_err(stream_id, "read", e.to_string()))?;
             let nonce = make_nonce(stream_id, counter);
             counter += 1;
             let pt = c
@@ -1425,7 +1455,8 @@ fn recv_range(
             left -= pt.len() as u64;
         } else {
             let want = left.min(buf.len() as u64) as usize;
-            sock.read_exact(&mut buf[..want]).map_err(|e| e.to_string())?;
+            sock.read_exact(&mut buf[..want])
+                .map_err(|e| io_err(stream_id, "read", e.to_string()))?;
             write_at_full(f, &buf[..want], off)?;
             got.fetch_add(want as u64, Ordering::Relaxed);
             off += want as u64;
@@ -1535,8 +1566,34 @@ fn write_at_full(f: &File, buf: &[u8], mut off: u64) -> Result<(), String> {
     Ok(())
 }
 
+fn io_timeout() -> Duration {
+    let secs = env::var("BBX_IO_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(IO_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Wrap a socket error with stream context, and name a timeout for what it is.
+/// A read/write timeout surfaces as WouldBlock (EAGAIN) on Unix.
+fn io_err(stream_id: u32, op: &str, e: String) -> String {
+    if e.contains("temporarily unavailable")
+        || e.contains("timed out")
+        || e.contains("os error 11")
+        || e.contains("os error 110")
+    {
+        format!("stream {stream_id} {op} timed out after {}s (peer stalled or dead)", io_timeout().as_secs())
+    } else {
+        format!("stream {stream_id} {op}: {e}")
+    }
+}
+
 fn tune(s: &TcpStream, wnd: usize) {
     let _ = s.set_nodelay(true);
+    let t = io_timeout();
+    let _ = s.set_read_timeout(Some(t));
+    let _ = s.set_write_timeout(Some(t));
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

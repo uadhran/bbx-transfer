@@ -69,3 +69,21 @@ jobs:
           $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 1 -c -E
           wait $SPID
           cmp /tmp/bbx-in.bin /tmp/bbx-out1.bin
+          # stalled peer must time out, not hang forever
+          dd if=/dev/urandom of=/tmp/bbx-big.bin bs=1M count=32 status=none
+          python3 -c '
+          import socket, time
+          srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          srv.bind(("127.0.0.1", 0)); srv.listen(8)
+          print(srv.getsockname()[1], flush=True)
+          conns = [srv.accept()[0] for _ in range(2)]  # accept but never read
+          time.sleep(60)
+          ' > /tmp/bbx-stall.txt &
+          PYPID=$!
+          for i in $(seq 1 100); do test -s /tmp/bbx-stall.txt && break; sleep 0.05; done
+          PORT=$(head -1 /tmp/bbx-stall.txt)
+          # source should fail within the 30s guard, not hang indefinitely
+          if BBX_IO_TIMEOUT_SECS=2 timeout 30 $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-big.bin -s 2 -C -E; then
+            echo "expected source to fail against a stalled peer"; kill $PYPID; exit 1
+          fi
+          kill $PYPID 2>/dev/null || true
