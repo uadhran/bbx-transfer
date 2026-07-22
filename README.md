@@ -43,11 +43,29 @@ Disable: `-C` (no checksum), `-E` (cleartext).
 |------|---------|
 | `-s N` | streams (default 4) |
 | `-w SIZE` | socket buffer hint |
-| `-P SEC` | progress |
+| `-P SEC` | progress interval |
 | `-c` / `-C` | BLAKE3 on/off (`cp` default on) |
 | `-e` / `-E` | encrypt on/off (`cp` default on) |
+| `-A` | **resume** partial destination |
+| `-R N` | source: resume from byte offset N |
+| `-J` | **JSON** progress lines on stdout |
 | `-z` | reverse dial |
 | `-k HEX` | session key (agents; usually automatic) |
+
+### Resume
+
+```sh
+# if dest already has a prefix (e.g. failed mid-copy):
+bbx cp -A -s 8 big.bin user@host:~/big.bin
+```
+
+### JSON progress
+
+```sh
+bbx source -a 127.0.0.1:PORT -i file -J -P 1
+# {"event":"progress","bytes":…,"total":…,"rate_mbps":…}
+# {"event":"done",…}
+```
 
 ## Why not bbcp
 
@@ -61,8 +79,12 @@ Disable: `-C` (no checksum), `-E` (cleartext).
 ## Status
 
 - [x] P0 multi-stream, push/pull, reverse, BLAKE3, SPEC, CI  
-- [x] **P1** encrypted data plane, install metadata  
-- [ ] P2 resume, JSON progress, benches  
+- [x] P1 encrypted data plane, install metadata  
+- [x] **P2** resume (`-A`), JSON (`-J`), local bench script  
+
+```sh
+./scripts/bench-local.sh   # loopback multi-stream timing
+```
 
 ## Security
 

@@ -25,10 +25,13 @@ Little-endian integers.
 | Field | Size | Notes |
 |-------|------|--------|
 | magic | 4 | `BBX2` |
-| flags | u32 | bit0 `FLAG_BLAKE3` (1), bit1 `FLAG_CRYPT` (2) |
-| size | u64 | file bytes |
+| flags | u32 | bit0 `FLAG_BLAKE3` (1), bit1 `FLAG_CRYPT` (2), bit2 `FLAG_RESUME` (4) |
+| size | u64 | **full** file bytes |
 | streams | u32 | N |
-| blake3 | 32 | if `FLAG_BLAKE3` |
+| resume_from | u64 | if `FLAG_RESUME`; start offset (prefix already on sink) |
+| blake3 | 32 | if `FLAG_BLAKE3` (hash of **full** file) |
+
+Payload covers only `[resume_from, size)`.
 
 ## Payload
 
@@ -57,6 +60,7 @@ Listener prints on stdout:
 ```
 PORT <u16>
 KEY <64 hex chars>    # only if encrypting
+RESUME <u64>          # only if sink -A (existing dest length)
 ```
 
 | Mode | Data plane |

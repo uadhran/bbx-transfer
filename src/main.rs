@@ -1,11 +1,7 @@
-//! bbx — multi-stream bulk copy (BBX2 + optional encrypted payload).
+//! bbx — multi-stream bulk copy (BBX2).
 //!
-//!   bbx sink   (-l|-a) -o FILE [-s N] [-w B] [-c|-C] [-e|-E] [-k HEX]
-//!   bbx source (-a|-l) -i FILE [-s N] [-w B] [-c|-C] [-e|-E] [-k HEX] [-P SEC]
-//!   bbx cp [-s N] [-w B] [-P SEC] [-c|-C] [-e|-E] [-z] SRC DEST
-//!
-//! See SPEC.md. Session key for -e is printed as KEY <hex> by the listener
-//! (over SSH stdout) or passed with -k.
+//! sink/source/cp with: -s -w -P -c|-C -e|-E -k -A (resume) -J (json) -z
+//! See SPEC.md.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -27,6 +23,7 @@ const CHUNK: usize = 1024 * 1024;
 const CRYPT_PT: usize = 64 * 1024;
 const FLAG_BLAKE3: u32 = 1;
 const FLAG_CRYPT: u32 = 2;
+const FLAG_RESUME: u32 = 4;
 
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -57,13 +54,12 @@ fn main() {
 fn usage(code: i32) {
     eprintln!(
         "bbx — multi-stream bulk copy (BBX2)\n\n\
-         bbx sink   (-l ADDR | -a ADDR) -o FILE [opts]\n\
-         bbx source (-a ADDR | -l ADDR) -i FILE [opts]\n\
-         bbx cp [opts] [-z] SRC DEST\n\n\
-         opts: -s N  -w SIZE  -P SEC  -c|-C (blake3)  -e|-E (encrypt)  -k HEX\n\
-         cp defaults: -c and -e on. -C / -E to disable.\n\
-         -z reverse dial. BBX_REMOTE= path on remote. BBX_ADVERTISE= dial-back IP.\n\
-         cargo install --path .   # or cargo install bbx (when published)\n"
+         bbx sink|source|cp …\n\
+         opts: -s N -w SIZE -P SEC -c|-C -e|-E -k HEX\n\
+               -A resume  -J json progress  -R BYTES (source resume offset)\n\
+               -z reverse\n\
+         cp defaults: -c -e on. -A resumes partial dest.\n\
+         BBX_REMOTE=  BBX_ADVERTISE=\n"
     );
     std::process::exit(code);
 }
@@ -85,6 +81,9 @@ struct Flags {
     crypt_set: bool,
     key: Option<[u8; 32]>,
     reverse: bool,
+    resume: bool,
+    resume_from: u64,
+    json: bool,
     rest: Vec<String>,
 }
 
@@ -103,6 +102,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         crypt_set: false,
         key: None,
         reverse: false,
+        resume: false,
+        resume_from: 0,
+        json: false,
         rest: Vec::new(),
     };
     let mut i = 0;
@@ -164,6 +166,15 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 f.key = Some(parse_key(need(args, i, "-k")?)?);
             }
             "-z" => f.reverse = true,
+            "-A" => f.resume = true,
+            "-J" => f.json = true,
+            "-R" => {
+                i += 1;
+                f.resume_from = need(args, i, "-R")?
+                    .parse()
+                    .map_err(|_| "bad -R".to_string())?;
+                f.resume = true;
+            }
             "--" => {
                 f.rest.extend_from_slice(&args[i + 1..]);
                 break;
@@ -232,6 +243,11 @@ fn ce_flags(check: bool, crypt: bool) -> String {
     )
 }
 
+fn resume_flag(resume: bool) -> &'static str {
+    if resume { " -A" } else { "" }
+}
+
+
 // --- commands --------------------------------------------------------------
 
 fn cmd_sink(args: &[String]) -> Result<(), String> {
@@ -240,8 +256,12 @@ fn cmd_sink(args: &[String]) -> Result<(), String> {
     let key = f.key;
     let crypt = f.crypt || key.is_some();
     match (&f.listen, &f.addr) {
-        (Some(l), None) => run_sink_listen(l, &out, f.streams, f.wnd, f.check, crypt, key),
-        (None, Some(a)) => run_sink_connect(a, &out, f.streams, f.wnd, f.check, crypt, key),
+        (Some(l), None) => {
+            run_sink_listen(l, &out, f.streams, f.wnd, f.check, crypt, key, f.resume, f.json)
+        }
+        (None, Some(a)) => {
+            run_sink_connect(a, &out, f.streams, f.wnd, f.check, crypt, key, f.resume, f.json)
+        }
         _ => Err("sink needs exactly one of -l ADDR or -a ADDR".into()),
     }
 }
@@ -251,13 +271,14 @@ fn cmd_source(args: &[String]) -> Result<(), String> {
     let input = f.input.ok_or("source needs -i FILE")?;
     let key = f.key;
     let crypt = f.crypt || key.is_some();
+    let rf = f.resume_from;
     match (&f.listen, &f.addr) {
-        (None, Some(a)) => {
-            run_source_connect(a, &input, f.streams, f.wnd, f.progress, f.check, crypt, key)
-        }
-        (Some(l), None) => {
-            run_source_listen(l, &input, f.streams, f.wnd, f.progress, f.check, crypt, key)
-        }
+        (None, Some(a)) => run_source_connect(
+            a, &input, f.streams, f.wnd, f.progress, f.check, crypt, key, rf, f.json,
+        ),
+        (Some(l), None) => run_source_listen(
+            l, &input, f.streams, f.wnd, f.progress, f.check, crypt, key, rf, f.json,
+        ),
         _ => Err("source needs exactly one of -a ADDR or -l ADDR".into()),
     }
 }
@@ -276,22 +297,24 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
     let w = f.wnd;
     let p = f.progress;
     let rev = f.reverse;
+    let resume = f.resume;
+    let json = f.json;
 
     match (is_remote_spec(src), is_remote_spec(dest)) {
         (false, true) => {
             let (remote, rpath) = split_host_path(dest)?;
             if rev {
-                cp_push_reverse(&bin, remote, rpath, src, s, w, p, check, crypt)
+                cp_push_reverse(&bin, remote, rpath, src, s, w, p, check, crypt, resume, json)
             } else {
-                cp_push_forward(&bin, remote, rpath, src, s, w, p, check, crypt)
+                cp_push_forward(&bin, remote, rpath, src, s, w, p, check, crypt, resume, json)
             }
         }
         (true, false) => {
             let (remote, rpath) = split_host_path(src)?;
             if rev {
-                cp_pull_reverse(&bin, remote, rpath, dest, s, w, p, check, crypt)
+                cp_pull_reverse(&bin, remote, rpath, dest, s, w, p, check, crypt, resume, json)
             } else {
-                cp_pull_forward(&bin, remote, rpath, dest, s, w, p, check, crypt)
+                cp_pull_forward(&bin, remote, rpath, dest, s, w, p, check, crypt, resume, json)
             }
         }
         (false, false) => Err("cp needs one remote host:path side".into()),
@@ -334,21 +357,26 @@ fn cp_push_forward(
     progress: u64,
     check: bool,
     crypt: bool,
+    resume: bool,
+    json: bool,
 ) -> Result<(), String> {
     let ce = ce_flags(check, crypt);
     let cmd = format!(
-        "{} sink -l 0.0.0.0:0 -o {} -s {streams} -w {wnd} {ce}",
+        "{} sink -l 0.0.0.0:0 -o {} -s {streams} -w {wnd} {ce}{}",
         shell_quote(bin),
-        shell_quote(rpath)
+        shell_quote(rpath),
+        resume_flag(resume)
     );
-    let (mut child, port, key) = ssh_start_banner(remote, &cmd, crypt)?;
+    let (mut child, port, key, resume_from) = ssh_start_banner(remote, &cmd, crypt, resume)?;
     let host = host_only(remote);
     let addr = format!("{host}:{port}");
-    eprintln!(
-        "bbx: push {local_src} → {remote}:{rpath} via {addr} streams={streams} check={check} crypt={crypt}"
-    );
+    if !json {
+        eprintln!(
+            "bbx: push {local_src} → {remote}:{rpath} via {addr} streams={streams} resume_from={resume_from} crypt={crypt}"
+        );
+    }
     let r = run_source_connect(
-        &addr, local_src, streams, wnd, progress, check, crypt, key,
+        &addr, local_src, streams, wnd, progress, check, crypt, key, resume_from, json,
     );
     let _ = child.wait();
     r
@@ -364,7 +392,15 @@ fn cp_push_reverse(
     progress: u64,
     check: bool,
     crypt: bool,
+    resume: bool,
+    json: bool,
 ) -> Result<(), String> {
+    // resume: ask remote for existing size
+    let resume_from = if resume {
+        remote_file_len(remote, rpath)?
+    } else {
+        0
+    };
     let listener = TcpListener::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let advertise =
@@ -377,15 +413,20 @@ fn cp_push_reverse(
         .map(|k| format!(" -k {}", hex(k)))
         .unwrap_or_default();
     let cmd = format!(
-        "{} sink -a {} -o {} -s {streams} -w {wnd} {ce}{karg}",
+        "{} sink -a {} -o {} -s {streams} -w {wnd} {ce}{}{karg}",
         shell_quote(bin),
         shell_quote(&addr),
-        shell_quote(rpath)
+        shell_quote(rpath),
+        resume_flag(resume)
     );
-    eprintln!("bbx: push -z {local_src} → {remote}:{rpath} (remote dials {addr}) crypt={crypt}");
+    if !json {
+        eprintln!(
+            "bbx: push -z {local_src} → {remote}:{rpath} dials {addr} resume_from={resume_from}"
+        );
+    }
     let mut child = ssh_spawn(remote, &cmd)?;
     let r = run_source_with_listener(
-        listener, local_src, streams, wnd, progress, check, crypt, key,
+        listener, local_src, streams, wnd, progress, check, crypt, key, resume_from, json,
     );
     let _ = child.wait();
     r
@@ -401,6 +442,8 @@ fn cp_pull_forward(
     progress: u64,
     check: bool,
     crypt: bool,
+    resume: bool,
+    json: bool,
 ) -> Result<(), String> {
     let listener = TcpListener::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -413,15 +456,29 @@ fn cp_pull_forward(
         .as_ref()
         .map(|k| format!(" -k {}", hex(k)))
         .unwrap_or_default();
+    let rf = if resume {
+        std::fs::metadata(local_dst).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    let rarg = if resume && rf > 0 {
+        format!(" -R {rf}")
+    } else {
+        String::new()
+    };
     let cmd = format!(
-        "{} source -a {} -i {} -s {streams} -w {wnd} {ce}{karg}",
+        "{} source -a {} -i {} -s {streams} -w {wnd} {ce}{karg}{rarg}",
         shell_quote(bin),
         shell_quote(&addr),
         shell_quote(rpath)
     );
-    eprintln!("bbx: pull {remote}:{rpath} → {local_dst} (remote dials {addr}) crypt={crypt}");
+    if !json {
+        eprintln!("bbx: pull {remote}:{rpath} → {local_dst} resume_from={rf}");
+    }
     let mut child = ssh_spawn(remote, &cmd)?;
-    let r = run_sink_with_listener(listener, local_dst, streams, wnd, check, progress, crypt, key);
+    let r = run_sink_with_listener(
+        listener, local_dst, streams, wnd, check, progress, crypt, key, resume, json,
+    );
     let _ = child.wait();
     r
 }
@@ -436,21 +493,55 @@ fn cp_pull_reverse(
     progress: u64,
     check: bool,
     crypt: bool,
+    resume: bool,
+    json: bool,
 ) -> Result<(), String> {
     let ce = ce_flags(check, crypt);
+    let rf = if resume {
+        std::fs::metadata(local_dst).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    let rarg = if resume && rf > 0 {
+        format!(" -R {rf}")
+    } else {
+        String::new()
+    };
     let cmd = format!(
-        "{} source -l 0.0.0.0:0 -i {} -s {streams} -w {wnd} {ce}",
+        "{} source -l 0.0.0.0:0 -i {} -s {streams} -w {wnd} {ce}{rarg}",
         shell_quote(bin),
         shell_quote(rpath)
     );
-    let (mut child, port, key) = ssh_start_banner(remote, &cmd, crypt)?;
+    let (mut child, port, key, _) = ssh_start_banner(remote, &cmd, crypt, false)?;
     let host = host_only(remote);
     let addr = format!("{host}:{port}");
-    eprintln!("bbx: pull -z {remote}:{rpath} → {local_dst} via {addr} crypt={crypt}");
-    let r = run_sink_connect(&addr, local_dst, streams, wnd, check, crypt, key);
+    if !json {
+        eprintln!("bbx: pull -z {remote}:{rpath} → {local_dst} via {addr} resume_from={rf}");
+    }
+    let r = run_sink_connect(&addr, local_dst, streams, wnd, check, crypt, key, resume, json);
     let _ = progress;
     let _ = child.wait();
     r
+}
+
+fn remote_file_len(remote: &str, path: &str) -> Result<u64, String> {
+    let out = Command::new("ssh")
+        .arg(remote)
+        .arg(format!(
+            "stat -c %s {} 2>/dev/null || echo 0",
+            shell_quote(path)
+        ))
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("ssh stat: {e}"))?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim()
+        .lines()
+        .last()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| format!("bad remote size: {s:?}"))
 }
 
 fn host_only(remote: &str) -> &str {
@@ -476,12 +567,13 @@ fn ssh_spawn(remote: &str, remote_cmd: &str) -> Result<Child, String> {
         .map_err(|e| format!("ssh: {e}"))
 }
 
-/// Read PORT and optional KEY lines from remote agent stdout.
+/// Read PORT, optional KEY, optional RESUME from remote agent stdout.
 fn ssh_start_banner(
     remote: &str,
     remote_cmd: &str,
     expect_key: bool,
-) -> Result<(Child, u16, Option<[u8; 32]>), String> {
+    expect_resume: bool,
+) -> Result<(Child, u16, Option<[u8; 32]>, u64), String> {
     let mut child = Command::new("ssh")
         .arg(remote)
         .arg(remote_cmd)
@@ -494,14 +586,20 @@ fn ssh_start_banner(
     let mut stdout = child.stdout.take().ok_or("ssh stdout")?;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 256];
-    let need_lines = if expect_key { 2 } else { 1 };
+    let mut need = 1;
+    if expect_key {
+        need += 1;
+    }
+    if expect_resume {
+        need += 1;
+    }
     loop {
         let n = stdout.read(&mut tmp).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&tmp[..n]);
-        if buf.iter().filter(|&&b| b == b'\n').count() >= need_lines || buf.len() > 512 {
+        if buf.iter().filter(|&&b| b == b'\n').count() >= need || buf.len() > 768 {
             break;
         }
     }
@@ -513,6 +611,7 @@ fn ssh_start_banner(
     let s = String::from_utf8_lossy(&buf);
     let mut port: Option<u16> = None;
     let mut key: Option<[u8; 32]> = None;
+    let mut resume_from: u64 = 0;
     for line in s.lines() {
         let mut w = line.split_whitespace();
         match w.next() {
@@ -527,6 +626,13 @@ fn ssh_start_banner(
             Some("KEY") => {
                 key = Some(parse_key(w.next().ok_or("KEY missing value")?)?);
             }
+            Some("RESUME") => {
+                resume_from = w
+                    .next()
+                    .ok_or("RESUME missing value")?
+                    .parse()
+                    .map_err(|_| "bad RESUME")?;
+            }
             _ => {}
         }
     }
@@ -534,18 +640,25 @@ fn ssh_start_banner(
     if expect_key && key.is_none() {
         return Err(format!("remote did not print KEY (upgrade remote bbx?): {s:?}"));
     }
-    Ok((child, port, key))
+    Ok((child, port, key, resume_from))
 }
 
 // --- transfer engine -------------------------------------------------------
 
-fn print_listen_banner(port: u16, crypt: bool, key: &Option<[u8; 32]>) {
+fn print_listen_banner(port: u16, crypt: bool, key: &Option<[u8; 32]>, resume_from: Option<u64>) {
     println!("PORT {port}");
     if crypt {
         let k = key.expect("crypt without key");
         println!("KEY {}", hex(&k));
     }
+    if let Some(r) = resume_from {
+        println!("RESUME {r}");
+    }
     let _ = io::stdout().flush();
+}
+
+fn existing_len(path: &str) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 fn run_sink_listen(
@@ -556,16 +669,19 @@ fn run_sink_listen(
     check: bool,
     crypt: bool,
     key: Option<[u8; 32]>,
+    resume: bool,
+    json: bool,
 ) -> Result<(), String> {
     let key = if crypt {
         Some(key.unwrap_or_else(gen_key))
     } else {
         None
     };
+    let have = if resume { Some(existing_len(out)) } else { None };
     let listener = TcpListener::bind(listen).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    print_listen_banner(port, crypt, &key);
-    run_sink_with_listener(listener, out, streams, wnd, check, 0, crypt, key)
+    print_listen_banner(port, crypt, &key, have);
+    run_sink_with_listener(listener, out, streams, wnd, check, 0, crypt, key, resume, json)
 }
 
 fn run_sink_connect(
@@ -576,6 +692,8 @@ fn run_sink_connect(
     check: bool,
     crypt: bool,
     key: Option<[u8; 32]>,
+    resume: bool,
+    json: bool,
 ) -> Result<(), String> {
     if crypt && key.is_none() {
         return Err("encrypt needs -k KEY (from peer KEY line)".into());
@@ -587,7 +705,7 @@ fn run_sink_connect(
         tune(&s, wnd);
         conns.push(s);
     }
-    finish_sink(conns, out, streams, check, 0, crypt, key)
+    finish_sink(conns, out, streams, check, 0, crypt, key, resume, json)
 }
 
 fn run_sink_with_listener(
@@ -599,6 +717,8 @@ fn run_sink_with_listener(
     progress: u64,
     crypt: bool,
     key: Option<[u8; 32]>,
+    resume: bool,
+    json: bool,
 ) -> Result<(), String> {
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
@@ -608,7 +728,7 @@ fn run_sink_with_listener(
         tune(&s, wnd);
         conns.push(s);
     }
-    finish_sink(conns, out, streams, check, progress, crypt, key)
+    finish_sink(conns, out, streams, check, progress, crypt, key, resume, json)
 }
 
 fn finish_sink(
@@ -619,6 +739,8 @@ fn finish_sink(
     progress: u64,
     crypt: bool,
     key: Option<[u8; 32]>,
+    resume: bool,
+    json: bool,
 ) -> Result<(), String> {
     let mut ctrl = conns.remove(0);
     let mut magic = [0u8; 4];
@@ -634,6 +756,12 @@ fn finish_sink(
     }
     let want_check = flags & FLAG_BLAKE3 != 0;
     let want_crypt = flags & FLAG_CRYPT != 0;
+    let want_resume = flags & FLAG_RESUME != 0;
+    let resume_from = if want_resume {
+        read_u64(&mut ctrl)?
+    } else {
+        0
+    };
     if want_crypt != crypt {
         return Err(format!(
             "crypt mismatch: local={} peer={}",
@@ -642,6 +770,12 @@ fn finish_sink(
     }
     if want_crypt && key.is_none() {
         return Err("peer sent FLAG_CRYPT but no session key".into());
+    }
+    if resume_from > size {
+        return Err(format!("resume_from {resume_from} > size {size}"));
+    }
+    if resume_from > 0 && !resume {
+        // peer resumed; sink must accept append open
     }
     let streams = n;
     if streams_hint != 0 && streams_hint != streams {
@@ -663,17 +797,30 @@ fn finish_sink(
             .map_err(|e| e.to_string())?;
     }
 
+    let have = existing_len(out);
+    if resume_from > 0 {
+        if have < resume_from {
+            return Err(format!(
+                "local file shorter than resume_from ({have} < {resume_from})"
+            ));
+        }
+        // keep prefix; grow/shrink to final size later
+    }
     let file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(resume_from == 0)
         .open(out)
         .map_err(|e| e.to_string())?;
     file.set_len(size).map_err(|e| e.to_string())?;
 
-    let ranges = split_ranges(size, streams);
+    let remaining = size - resume_from;
+    let ranges = split_ranges(remaining, streams)
+        .into_iter()
+        .map(|(a, b)| (a + resume_from, b + resume_from))
+        .collect::<Vec<_>>();
     let file = Arc::new(file);
-    let got = Arc::new(AtomicU64::new(0));
+    let got = Arc::new(AtomicU64::new(resume_from));
     let t0 = Instant::now();
     let key = key.map(Arc::new);
     if progress > 0 {
@@ -681,7 +828,7 @@ fn finish_sink(
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(progress.max(1)));
             let n = g.load(Ordering::Relaxed);
-            eprint_progress(n, size, t0);
+            report_progress(n, size, t0, json);
             if n >= size {
                 break;
             }
@@ -703,8 +850,10 @@ fn finish_sink(
     }
 
     if want_check {
-        eprint!("\nbbx: verifying BLAKE3… ");
-        let _ = io::stderr().flush();
+        if !json {
+            eprint!("\nbbx: verifying BLAKE3… ");
+            let _ = io::stderr().flush();
+        }
         let got_hash = hash_file(out)?;
         if got_hash != expect_hash {
             return Err(format!(
@@ -713,11 +862,20 @@ fn finish_sink(
                 hex(&got_hash)
             ));
         }
-        eprintln!("ok");
+        if !json {
+            eprintln!("ok");
+        }
     }
     if progress > 0 {
-        eprint_progress(size, size, t0);
-        eprintln!();
+        report_progress(size, size, t0, json);
+        if !json {
+            eprintln!();
+        }
+    }
+    if json {
+        println!(
+            r#"{{"event":"done","bytes":{size},"total":{size},"resumed_from":{resume_from}}}"#
+        );
     }
     Ok(())
 }
@@ -731,6 +889,8 @@ fn run_source_connect(
     check: bool,
     crypt: bool,
     key: Option<[u8; 32]>,
+    resume_from: u64,
+    json: bool,
 ) -> Result<(), String> {
     if crypt && key.is_none() {
         return Err("encrypt needs session KEY from peer".into());
@@ -742,7 +902,7 @@ fn run_source_connect(
         tune(&s, wnd);
         conns.push(s);
     }
-    finish_source(conns, input, streams, progress, check, crypt, key)
+    finish_source(conns, input, streams, progress, check, crypt, key, resume_from, json)
 }
 
 fn run_source_listen(
@@ -754,6 +914,8 @@ fn run_source_listen(
     check: bool,
     crypt: bool,
     key: Option<[u8; 32]>,
+    resume_from: u64,
+    json: bool,
 ) -> Result<(), String> {
     let key = if crypt {
         Some(key.unwrap_or_else(gen_key))
@@ -762,8 +924,10 @@ fn run_source_listen(
     };
     let listener = TcpListener::bind(listen).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    print_listen_banner(port, crypt, &key);
-    run_source_with_listener(listener, input, streams, wnd, progress, check, crypt, key)
+    print_listen_banner(port, crypt, &key, None);
+    run_source_with_listener(
+        listener, input, streams, wnd, progress, check, crypt, key, resume_from, json,
+    )
 }
 
 fn run_source_with_listener(
@@ -775,6 +939,8 @@ fn run_source_with_listener(
     check: bool,
     crypt: bool,
     key: Option<[u8; 32]>,
+    resume_from: u64,
+    json: bool,
 ) -> Result<(), String> {
     let mut conns = Vec::with_capacity(streams);
     for i in 0..streams {
@@ -784,7 +950,7 @@ fn run_source_with_listener(
         tune(&s, wnd);
         conns.push(s);
     }
-    finish_source(conns, input, streams, progress, check, crypt, key)
+    finish_source(conns, input, streams, progress, check, crypt, key, resume_from, json)
 }
 
 fn finish_source(
@@ -795,6 +961,8 @@ fn finish_source(
     check: bool,
     crypt: bool,
     key: Option<[u8; 32]>,
+    resume_from: u64,
+    json: bool,
 ) -> Result<(), String> {
     if conns.len() != streams {
         return Err(format!("expected {streams} streams, got {}", conns.len()));
@@ -804,12 +972,27 @@ fn finish_source(
     }
     let file = File::open(input).map_err(|e| e.to_string())?;
     let size = file.metadata().map_err(|e| e.to_string())?.len();
+    if resume_from > size {
+        return Err(format!("resume_from {resume_from} > file size {size}"));
+    }
+    if resume_from == size {
+        if json {
+            println!(r#"{{"event":"done","bytes":{size},"total":{size},"resumed_from":{resume_from},"skipped":true}}"#);
+        } else {
+            eprintln!("bbx: already complete ({size} bytes)");
+        }
+        return Ok(());
+    }
 
     let hash = if check {
-        eprint!("bbx: hashing BLAKE3… ");
-        let _ = io::stderr().flush();
+        if !json {
+            eprint!("bbx: hashing BLAKE3… ");
+            let _ = io::stderr().flush();
+        }
         let h = hash_file(input)?;
-        eprintln!("ok");
+        if !json {
+            eprintln!("ok");
+        }
         Some(h)
     } else {
         None
@@ -824,15 +1007,25 @@ fn finish_source(
     if crypt {
         flags |= FLAG_CRYPT;
     }
+    if resume_from > 0 {
+        flags |= FLAG_RESUME;
+    }
     write_u32(&mut ctrl, flags)?;
     write_u64(&mut ctrl, size)?;
     write_u32(&mut ctrl, streams as u32)?;
+    if resume_from > 0 {
+        write_u64(&mut ctrl, resume_from)?;
+    }
     if let Some(h) = hash {
         ctrl.write_all(&h).map_err(|e| e.to_string())?;
     }
 
-    let ranges = split_ranges(size, streams);
-    let sent = Arc::new(AtomicU64::new(0));
+    let remaining = size - resume_from;
+    let ranges = split_ranges(remaining, streams)
+        .into_iter()
+        .map(|(a, b)| (a + resume_from, b + resume_from))
+        .collect::<Vec<_>>();
+    let sent = Arc::new(AtomicU64::new(resume_from));
     let t0 = Instant::now();
     let file = Arc::new(file);
     let key = key.map(Arc::new);
@@ -842,7 +1035,7 @@ fn finish_source(
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(progress.max(1)));
             let n = sent_p.load(Ordering::Relaxed);
-            eprint_progress(n, size, t0);
+            report_progress(n, size, t0, json);
             if n >= size {
                 break;
             }
@@ -862,15 +1055,27 @@ fn finish_source(
     for h in handles {
         h.join().map_err(|_| "thread panic".to_string())??;
     }
-    eprint_progress(size, size, t0);
+    report_progress(size, size, t0, json);
     let elapsed = t0.elapsed().as_secs_f64().max(0.001);
-    eprintln!(
-        "\nbbx: done {} bytes in {:.2}s ({:.1} MB/s){}",
-        size,
-        elapsed,
-        size as f64 / elapsed / 1024.0 / 1024.0,
-        if crypt { " [encrypted]" } else { "" }
-    );
+    if json {
+        println!(
+            r#"{{"event":"done","bytes":{size},"total":{size},"secs":{elapsed:.3},"resumed_from":{resume_from},"encrypted":{}}}"#,
+            if crypt { "true" } else { "false" }
+        );
+    } else {
+        eprintln!(
+            "\nbbx: done {} bytes in {:.2}s ({:.1} MB/s){}{}",
+            size,
+            elapsed,
+            size as f64 / elapsed / 1024.0 / 1024.0,
+            if crypt { " [encrypted]" } else { "" },
+            if resume_from > 0 {
+                format!(" [resumed from {resume_from}]")
+            } else {
+                String::new()
+            }
+        );
+    }
     Ok(())
 }
 
@@ -984,6 +1189,18 @@ fn hash_file(path: &str) -> Result<[u8; 32], String> {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn report_progress(n: u64, size: u64, t0: Instant, json: bool) {
+    if json {
+        let elapsed = t0.elapsed().as_secs_f64().max(0.001);
+        let rate = (n as f64 / elapsed) / (1024.0 * 1024.0);
+        println!(
+            r#"{{"event":"progress","bytes":{n},"total":{size},"rate_mbps":{rate:.3}}}"#
+        );
+    } else {
+        eprint_progress(n, size, t0);
+    }
 }
 
 fn eprint_progress(n: u64, size: u64, t0: Instant) {

@@ -39,3 +39,13 @@ jobs:
           $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -c -e -k "$KEY" -P 1
           wait $SPID
           cmp /tmp/bbx-in.bin /tmp/bbx-out2.bin
+          # resume
+          dd if=/tmp/bbx-in.bin of=/tmp/bbx-part.bin bs=1M count=2 status=none
+          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-part.bin -s 4 -C -E -A > /tmp/bbx-port3.txt &
+          SPID=$!
+          for i in $(seq 1 50); do grep -q '^RESUME ' /tmp/bbx-port3.txt 2>/dev/null && break; sleep 0.05; done
+          PORT=$(awk '/^PORT/{print $2; exit}' /tmp/bbx-port3.txt)
+          RF=$(awk '/^RESUME/{print $2; exit}' /tmp/bbx-port3.txt)
+          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -C -E -R "$RF"
+          wait $SPID
+          cmp /tmp/bbx-in.bin /tmp/bbx-part.bin

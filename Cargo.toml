@@ -1,8 +1,8 @@
 [package]
 name = "bbx"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Multi-stream bulk copy — BBX2, BLAKE3, encrypted data plane, push/pull/reverse"
+description = "Multi-stream bulk copy — BBX2, BLAKE3, encrypt, resume, JSON progress, push/pull/reverse"
 license = "MIT"
 readme = "README.md"
 keywords = ["copy", "transfer", "scp", "bbcp", "network"]
