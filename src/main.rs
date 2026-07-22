@@ -230,8 +230,23 @@ fn gen_key() -> [u8; 32] {
     k
 }
 
+/// Quote a path/arg for remote `sh` via ssh.
+/// Leading `~/` becomes `"$HOME/..."` so tilde expands (single-quoted `~` does not).
 fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\"'\"'"))
+    if let Some(rest) = s.strip_prefix("~/") {
+        format!("\"$HOME/{}\"", shell_escape_dq(rest))
+    } else if s == "~" {
+        "\"$HOME\"".into()
+    } else {
+        format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn shell_escape_dq(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
 }
 
 fn remote_bin() -> String {
