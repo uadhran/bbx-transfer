@@ -1,10 +1,11 @@
-# bbx
+# bbx — multi-stream encrypted bulk copy
 
-Multi-stream bulk file copy in Rust.
+> GitHub: **[uadhran/bbx-transfer](https://github.com/uadhran/bbx-transfer)** · CLI binary: **`bbx`**  
+> Keywords: `rust` `file-transfer` `scp` `bbcp` `multi-stream` `blake3` `chacha20`
 
-**BBX2** open protocol · **BLAKE3** verify · **ChaCha20-Poly1305** data plane · push/pull/reverse.
+Fast parallel file copy over many TCP streams (bbcp-class), with an **open BBX2 protocol**, **BLAKE3** verify, and **ChaCha20-Poly1305** on the data plane.
 
-Not wire-compatible with [bbcp](https://www.slac.stanford.edu/~abh/bbcp/).
+Not wire-compatible with classic [bbcp](https://www.slac.stanford.edu/~abh/bbcp/).
 
 ## Install
 
