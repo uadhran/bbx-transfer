@@ -1,1 +1,3 @@
+/bench/
+.playwright-mcp/
 /target

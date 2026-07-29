@@ -101,7 +101,6 @@ Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv)
 - [SPEC.md](SPEC.md) — wire protocol  
 - [ROADMAP.md](ROADMAP.md) — open work  
 - [CONTRIBUTING.md](CONTRIBUTING.md)  
-- `bench/` — local bake-off harness (not a product feature)
 
 ## License
 
