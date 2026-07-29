@@ -1,110 +1,107 @@
-# bbx — multi-stream encrypted bulk copy
+# bbx — multi-stream bulk copy
 
-> GitHub: **[uadhran/bbx-transfer](https://github.com/uadhran/bbx-transfer)** · CLI binary: **`bbx`**  
-> Keywords: `rust` `file-transfer` `scp` `bbcp` `multi-stream` `blake3` `chacha20`
+> GitHub: **[uadhran/bbx-transfer](https://github.com/uadhran/bbx-transfer)** · CLI binary: **`bbx`**
 
-Fast parallel file copy over many TCP streams (bbcp-class), with an **open BBX2 protocol**, **BLAKE3** verify, and **ChaCha20-Poly1305** on the data plane.
+Internal-first **TCP multi-stream** file copy (bbcp-class), open **BBX2** protocol, optional **BLAKE3** + **ChaCha20-Poly1305**.
 
-Not wire-compatible with classic [bbcp](https://www.slac.stanford.edu/~abh/bbcp/).
+**Not** rsync (no delta/sync). **Not** QUIC. **Not** on crates.io (binary name `bbx` is unrelated to the BBCode crate).
 
-## Install
+Same `bbx` version on **both** hosts.
+
+## Scope
+
+| Use bbx when | Use something else when |
+|--------------|-------------------------|
+| Large files over high-latency / multi-stream TCP | Tree sync / incremental → rsync, `sy` |
+| UDP is blocked (QUIC tools fail) | You need object storage → rclone/S3 tools |
+| You control both ends and can open a TCP port range | Single-stream scp is already enough |
+
+## Install (both ends)
 
 ```sh
-# from clone
-cargo install --path .
-
-# after crates.io publish
-# cargo install bbx
+cargo build --release
+# local: target/release/bbx
+# remote: same binary
+./scripts/install-remote.sh user@host /home/user/bin/bbx
+export BBX_REMOTE=/home/user/bin/bbx
 ```
 
-Binary: `~/.cargo/bin/bbx` (or `target/release/bbx`). **Same version on both hosts.**
+Or copy by hand: `scp target/release/bbx user@host:~/bin/bbx`.
 
-## Quick remote push
+## Quick remote push / pull
 
 ```sh
 export BBX_REMOTE=/path/to/bbx   # on remote
-bbx cp -s 8 -P 5 big.bin user@host:~/big.bin
-# defaults: BLAKE3 + encrypt on
+bbx cp -s 8 big.bin user@host:~/big.bin
+bbx cp -s 8 user@host:~/big.bin ./big.bin
+# defaults: BLAKE3 + encrypt on. Clear: -C -E
 ```
 
-Disable: `-C` (no checksum), `-E` (cleartext).
+## Firewall: fixed port range
 
-## Modes
+Data plane needs N TCP connections (streams). Ephemeral ports are painful behind strict firewalls.
 
-| | Command |
-|--|---------|
-| Push | `bbx cp local user@host:path` |
-| Pull | `bbx cp user@host:path local` |
-| Reverse | add `-z` + `BBX_ADVERTISE=your.ip` |
+```sh
+# open 50000-50063 on the listening side, then:
+bbx cp -s 8 -Z 50000-50063 big.bin user@host:~/big.bin
+# or:
+export BBX_PORT_RANGE=50000-50063
+```
+
+`-Z` / `BBX_PORT_RANGE` applies to the **listener** (remote on forward push, local on pull / `-z`).
+
+## Reverse dial
+
+When the remote must dial you (`-z` push, or default pull):
+
+```sh
+export BBX_ADVERTISE=203.0.113.10   # if auto-detect is wrong
+bbx cp -z -s 8 big.bin user@host:~/big.bin
+```
+
+Auto-detect order: `BBX_ADVERTISE` → route toward remote host → default-route UDP → else `127.0.0.1` (will fail for real remotes).
 
 ## Flags
 
 | Flag | Meaning |
 |------|---------|
-| `-s N` | streams (default 4) |
+| `-s N` | streams (default 4, max 64) |
 | `-w SIZE` | socket buffer hint |
 | `-P SEC` | progress interval |
 | `-c` / `-C` | BLAKE3 on/off (`cp` default on) |
 | `-e` / `-E` | encrypt on/off (`cp` default on) |
-| `-A` | **resume** partial destination |
+| `-A` | resume partial dest |
 | `-R N` | source: resume from byte offset N |
-| `-J` | **JSON** progress lines on stdout |
-| `-r` | **recursive** directory trees (one session per file) |
+| `-J` | JSON progress on stdout |
+| `-r` | recursive dirs (**one session per file**, chatty for tiny files) |
 | `-z` | reverse dial |
-| `-k HEX` | session key (agents; usually automatic) |
+| `-Z LO-HI` | listen port range |
+| `-k HEX` | session key (manual; remote prefers `BBX_KEY` env) |
 
-### Resume
-
-```sh
-# if dest already has a prefix (e.g. failed mid-copy):
-bbx cp -A -s 8 big.bin user@host:~/big.bin
-```
-
-### JSON progress
-
-```sh
-bbx source -a 127.0.0.1:PORT -i file -J -P 1
-# {"event":"progress","bytes":…,"total":…,"rate_mbps":…}
-# {"event":"done",…}
-```
-
-## Why not bbcp
-
-| | bbcp | bbx |
-|--|------|-----|
-| Protocol | closed C++ | [SPEC.md](SPEC.md) |
-| Data plane | often cleartext | **AEAD default** |
-| Direction | awkward | push + pull + `-z` |
-| Build | makefile zoo | `cargo install` |
-
-## Status / roadmap
-
-**Shipped P0–P4.** Open work and future ideas live in **[ROADMAP.md](ROADMAP.md)** (contributor-friendly open items C2–C12, F1–F8 future).
-
-```sh
-./scripts/bench-local.sh   # loopback multi-stream timing
-bbx cp -r ./mydir user@host:~/mydir
-```
+Env: `BBX_REMOTE`, `BBX_ADVERTISE`, `BBX_KEY`, `BBX_PORT_RANGE`, `BBX_IO_TIMEOUT_SECS` (default 120).
 
 ## Reliability
 
-Data sockets, connect, and `accept()` are all bounded by a timeout (default 120s,
-override with `BBX_IO_TIMEOUT_SECS`), and one failing stream aborts the rest — a
-stalled or dead peer fails the transfer instead of hanging.
+- Connect timeout 30s; accept / read / write timeout `BBX_IO_TIMEOUT_SECS` (default 120s).
+- One dead stream aborts the transfer.
+- Failed transfer kills the remote SSH agent process.
 
 ## Security
 
-Session key is established over SSH: the listener prints it in the `KEY` banner, or
-the dial-out side passes it to the remote via the `BBX_KEY` environment variable —
-never `-k` on the remote's argv, so it isn't exposed to a plain `ps`. Data sockets
-use ChaCha20-Poly1305 when `-e`. See [SPEC threat model](SPEC.md#threat-model).
+Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv). Data plane AEAD when `-e`. See [SPEC.md](SPEC.md#threat-model).
 
 ## Limitations
 
-- Verification is negotiated by the **source**: the sink verifies iff the source
-  sent a BLAKE3 hash, so the sink's own `-c`/`-C` is advisory (C12).
-- IPv6 `host:path` specs (`[::1]:path`) aren't parsed yet (C11).
-- `-r` runs one session per file — simple, but chatty for many small files.
+- Sink `-c`/`-C` is advisory; verification is source-negotiated.
+- IPv6 `host:path` (`[::1]:path`) not fully supported for `cp` specs.
+- `-r` is sequential per file — not a tiny-file / metadata tool.
+
+## Docs
+
+- [SPEC.md](SPEC.md) — wire protocol  
+- [ROADMAP.md](ROADMAP.md) — open work  
+- [CONTRIBUTING.md](CONTRIBUTING.md)  
+- `bench/` — local bake-off harness (not a product feature)
 
 ## License
 

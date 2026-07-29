@@ -10,10 +10,11 @@ cargo build --release
 
 ## Where to start
 
-1. Read **[ROADMAP.md](ROADMAP.md)** — shipped vs open vs future.  
-2. Pick an **open** item (C1–C10), not a “future/hard” item, unless you propose a design first.  
+1. Read **[ROADMAP.md](ROADMAP.md)** — shipped vs open vs non-goals.  
+2. Pick an **open** item; skip non-goals (QUIC, crates.io) unless design first.  
 3. Open a PR against `master`.  
-4. Wire changes → update **[SPEC.md](SPEC.md)** in the same PR.
+4. Wire changes → update **[SPEC.md](SPEC.md)** in the same PR.  
+5. Binary is `bbx`; GitHub repo is `bbx-transfer`. Do not publish as crate name `bbx` (taken).
 
 ## Rules of the road
 

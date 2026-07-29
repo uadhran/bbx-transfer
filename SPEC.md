@@ -66,9 +66,22 @@ RESUME <u64>          # only if sink -A (existing dest length)
 | Mode | Data plane |
 |------|------------|
 | push | remote sink listens; local source connects |
-| push `-z` | local source listens; remote sink dials `BBX_ADVERTISE` (+ `-k`) |
+| push `-z` | local source listens; remote sink dials advertise IP |
 | pull | local sink listens; remote source dials |
 | pull `-z` | remote source listens; local sink connects |
+
+### Listen port range (firewall)
+
+`-Z LO-HI` or env `BBX_PORT_RANGE=LO-HI`: when the listen address uses port **0**, bind the first free port in the inclusive range instead of the OS ephemeral pool. Explicit ports in `-l host:PORT` are unchanged.
+
+### Advertise IP (reverse / pull listen)
+
+Peer dial address host part:
+
+1. `BBX_ADVERTISE` if set  
+2. else local IP on the route toward the SSH peer host  
+3. else default-route UDP probe  
+4. else `127.0.0.1` (loopback — only useful for same-host tests)
 
 ## Threat model
 

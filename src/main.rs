@@ -63,9 +63,9 @@ fn usage(code: i32) {
          bbx sink|source|cp …\n\
          opts: -s N -w SIZE -P SEC -c|-C -e|-E -k HEX\n\
                -A resume  -J json  -r recurse dirs  -R BYTES\n\
-               -z reverse\n\
+               -z reverse  -Z LO-HI  listen port range (firewall)\n\
          cp defaults: -c -e on. -A resumes partial dest.\n\
-         BBX_REMOTE=  BBX_ADVERTISE=  BBX_KEY=\n"
+         BBX_REMOTE=  BBX_ADVERTISE=  BBX_KEY=  BBX_PORT_RANGE=  BBX_IO_TIMEOUT_SECS=\n"
     );
     std::process::exit(code);
 }
@@ -91,6 +91,8 @@ struct Flags {
     resume_from: u64,
     json: bool,
     recurse: bool,
+    /// Inclusive listen port range for firewall-friendly binds (`-Z` / `BBX_PORT_RANGE`).
+    port_range: Option<(u16, u16)>,
     rest: Vec<String>,
 }
 
@@ -113,6 +115,7 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         resume_from: 0,
         json: false,
         recurse: false,
+        port_range: None,
         rest: Vec::new(),
     };
     let mut i = 0;
@@ -184,6 +187,10 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
                     .map_err(|_| "bad -R".to_string())?;
                 f.resume = true;
             }
+            "-Z" => {
+                i += 1;
+                f.port_range = Some(parse_port_range(need(args, i, "-Z")?)?);
+            }
             "--" => {
                 f.rest.extend_from_slice(&args[i + 1..]);
                 break;
@@ -193,7 +200,101 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         }
         i += 1;
     }
+    if f.port_range.is_none() {
+        if let Ok(s) = env::var("BBX_PORT_RANGE") {
+            if !s.trim().is_empty() {
+                f.port_range = Some(parse_port_range(&s)?);
+            }
+        }
+    }
     Ok(f)
+}
+
+/// `LO-HI` or `LO:HI` inclusive. LO must be ≥1.
+fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
+    let s = s.trim();
+    let (a, b) = s
+        .split_once('-')
+        .or_else(|| s.split_once(':'))
+        .ok_or_else(|| format!("bad port range {s:?}, want LO-HI"))?;
+    let lo: u16 = a
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad port range low in {s:?}"))?;
+    let hi: u16 = b
+        .trim()
+        .parse()
+        .map_err(|_| format!("bad port range high in {s:?}"))?;
+    if lo == 0 {
+        return Err("port range LO must be ≥ 1".into());
+    }
+    if hi < lo {
+        return Err(format!("port range HI {hi} < LO {lo}"));
+    }
+    Ok((lo, hi))
+}
+
+fn z_flag(range: Option<(u16, u16)>) -> String {
+    match range {
+        Some((lo, hi)) => format!(" -Z {lo}-{hi}"),
+        None => String::new(),
+    }
+}
+
+/// Bind `host:port`. Port 0 + range → first free in range; port 0 alone → OS ephemeral.
+fn bind_listener(spec: &str, range: Option<(u16, u16)>) -> Result<TcpListener, String> {
+    let (host, port) = split_listen_spec(spec)?;
+    if port != 0 {
+        return TcpListener::bind((host.as_str(), port))
+            .map_err(|e| format!("bind {host}:{port}: {e}"));
+    }
+    if let Some((lo, hi)) = range {
+        let mut last = None;
+        for p in lo..=hi {
+            match TcpListener::bind((host.as_str(), p)) {
+                Ok(l) => return Ok(l),
+                Err(e) => last = Some(e),
+            }
+        }
+        return Err(format!(
+            "no free listen port in {lo}-{hi} on {host}: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        ));
+    }
+    TcpListener::bind((host.as_str(), 0u16)).map_err(|e| format!("bind {host}:0: {e}"))
+}
+
+fn bind_ephemeral(range: Option<(u16, u16)>) -> Result<TcpListener, String> {
+    bind_listener("0.0.0.0:0", range)
+}
+
+fn split_listen_spec(spec: &str) -> Result<(String, u16), String> {
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix('[') {
+        // [v6]:port
+        let end = rest
+            .find(']')
+            .ok_or_else(|| format!("bad listen addr {spec:?}"))?;
+        let host = rest[..end].to_string();
+        let after = &rest[end + 1..];
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("bad listen addr {spec:?}"))?
+            .parse()
+            .map_err(|_| format!("bad listen port in {spec:?}"))?;
+        return Ok((host, port));
+    }
+    let idx = spec
+        .rfind(':')
+        .ok_or_else(|| format!("bad listen addr {spec:?}, want host:port"))?;
+    let host = spec[..idx].to_string();
+    let port: u16 = spec[idx + 1..]
+        .parse()
+        .map_err(|_| format!("bad listen port in {spec:?}"))?;
+    if host.is_empty() {
+        return Err(format!("bad listen host in {spec:?}"));
+    }
+    Ok((host, port))
 }
 
 fn need<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
@@ -287,9 +388,9 @@ fn cmd_sink(args: &[String]) -> Result<(), String> {
     let key = f.key.or_else(env_key);
     let crypt = f.crypt || key.is_some();
     match (&f.listen, &f.addr) {
-        (Some(l), None) => {
-            run_sink_listen(l, &out, f.streams, f.wnd, f.check, crypt, key, f.resume, f.json)
-        }
+        (Some(l), None) => run_sink_listen(
+            l, f.port_range, &out, f.streams, f.wnd, f.check, crypt, key, f.resume, f.json,
+        ),
         (None, Some(a)) => {
             run_sink_connect(a, &out, f.streams, f.wnd, f.check, crypt, key, f.resume, f.json)
         }
@@ -308,7 +409,7 @@ fn cmd_source(args: &[String]) -> Result<(), String> {
             a, &input, f.streams, f.wnd, f.progress, f.check, crypt, key, rf, f.json,
         ),
         (Some(l), None) => run_source_listen(
-            l, &input, f.streams, f.wnd, f.progress, f.check, crypt, key, rf, f.json,
+            l, f.port_range, &input, f.streams, f.wnd, f.progress, f.check, crypt, key, rf, f.json,
         ),
         _ => Err("source needs exactly one of -a ADDR or -l ADDR".into()),
     }
@@ -331,26 +432,39 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
     let resume = f.resume;
     let json = f.json;
     let recurse = f.recurse;
+    let pr = f.port_range;
 
     match (is_remote_spec(src), is_remote_spec(dest)) {
         (false, true) => {
             let (remote, rpath) = split_host_path(dest)?;
             if recurse {
-                cp_push_tree(&bin, remote, rpath, src, s, w, p, check, crypt, resume, json, rev)
+                cp_push_tree(
+                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, rev, pr,
+                )
             } else if rev {
-                cp_push_reverse(&bin, remote, rpath, src, s, w, p, check, crypt, resume, json)
+                cp_push_reverse(
+                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, pr,
+                )
             } else {
-                cp_push_forward(&bin, remote, rpath, src, s, w, p, check, crypt, resume, json)
+                cp_push_forward(
+                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, pr,
+                )
             }
         }
         (true, false) => {
             let (remote, rpath) = split_host_path(src)?;
             if recurse {
-                cp_pull_tree(&bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, rev)
+                cp_pull_tree(
+                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, rev, pr,
+                )
             } else if rev {
-                cp_pull_reverse(&bin, remote, rpath, dest, s, w, p, check, crypt, resume, json)
+                cp_pull_reverse(
+                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, pr,
+                )
             } else {
-                cp_pull_forward(&bin, remote, rpath, dest, s, w, p, check, crypt, resume, json)
+                cp_pull_forward(
+                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, pr,
+                )
             }
         }
         (false, false) => Err("cp needs one remote host:path side".into()),
@@ -505,6 +619,7 @@ fn cp_push_tree(
     resume: bool,
     json: bool,
     rev: bool,
+    port_range: Option<(u16, u16)>,
 ) -> Result<(), String> {
     let root = std::path::Path::new(local_src);
     let files = walk_local_files(root)?;
@@ -534,12 +649,12 @@ fn cp_push_tree(
         if rev {
             cp_push_reverse(
                 bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
-                resume, json,
+                resume, json, port_range,
             )?;
         } else {
             cp_push_forward(
                 bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
-                resume, json,
+                resume, json, port_range,
             )?;
         }
     }
@@ -567,6 +682,7 @@ fn cp_pull_tree(
     resume: bool,
     json: bool,
     rev: bool,
+    port_range: Option<(u16, u16)>,
 ) -> Result<(), String> {
     let files = remote_list_files(remote, rpath)?;
     if files.is_empty() {
@@ -599,12 +715,12 @@ fn cp_pull_tree(
         if rev {
             cp_pull_reverse(
                 bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
-                resume, json,
+                resume, json, port_range,
             )?;
         } else {
             cp_pull_forward(
                 bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
-                resume, json,
+                resume, json, port_range,
             )?;
         }
     }
@@ -633,10 +749,12 @@ fn cp_push_forward(
     crypt: bool,
     resume: bool,
     json: bool,
+    port_range: Option<(u16, u16)>,
 ) -> Result<(), String> {
     let ce = ce_flags(check, crypt);
+    let z = z_flag(port_range);
     let cmd = format!(
-        "{} sink -l 0.0.0.0:0 -o {} -s {streams} -w {wnd} {ce}{}",
+        "{} sink -l 0.0.0.0:0{z} -o {} -s {streams} -w {wnd} {ce}{}",
         shell_quote(bin),
         shell_quote(rpath),
         resume_flag(resume)
@@ -652,8 +770,7 @@ fn cp_push_forward(
     let r = run_source_connect(
         &addr, local_src, streams, wnd, progress, check, crypt, key, resume_from, json,
     );
-    let _ = child.wait();
-    r
+    finish_agent(&mut child, r, "push remote sink")
 }
 
 fn cp_push_reverse(
@@ -668,6 +785,7 @@ fn cp_push_reverse(
     crypt: bool,
     resume: bool,
     json: bool,
+    port_range: Option<(u16, u16)>,
 ) -> Result<(), String> {
     // resume: ask remote for existing size
     let resume_from = if resume {
@@ -675,10 +793,9 @@ fn cp_push_reverse(
     } else {
         0
     };
-    let listener = TcpListener::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let listener = bind_ephemeral(port_range)?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let advertise =
-        env::var("BBX_ADVERTISE").unwrap_or_else(|_| guess_local_ip().unwrap_or_else(|| "127.0.0.1".into()));
+    let advertise = advertise_ip(Some(remote));
     let addr = format!("{advertise}:{port}");
     let key = if crypt { Some(gen_key()) } else { None };
     let ce = ce_flags(check, crypt);
@@ -704,8 +821,7 @@ fn cp_push_reverse(
     let r = run_source_with_listener(
         listener, local_src, streams, wnd, progress, check, crypt, key, resume_from, json,
     );
-    let _ = child.wait();
-    r
+    finish_agent(&mut child, r, "push -z remote sink")
 }
 
 fn cp_pull_forward(
@@ -720,11 +836,11 @@ fn cp_pull_forward(
     crypt: bool,
     resume: bool,
     json: bool,
+    port_range: Option<(u16, u16)>,
 ) -> Result<(), String> {
-    let listener = TcpListener::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let listener = bind_ephemeral(port_range)?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let advertise =
-        env::var("BBX_ADVERTISE").unwrap_or_else(|_| guess_local_ip().unwrap_or_else(|| "127.0.0.1".into()));
+    let advertise = advertise_ip(Some(remote));
     let addr = format!("{advertise}:{port}");
     let key = if crypt { Some(gen_key()) } else { None };
     let ce = ce_flags(check, crypt);
@@ -750,14 +866,13 @@ fn cp_pull_forward(
         shell_quote(rpath)
     );
     if !json {
-        eprintln!("bbx: pull {remote}:{rpath} → {local_dst} resume_from={rf}");
+        eprintln!("bbx: pull {remote}:{rpath} → {local_dst} listen={addr} resume_from={rf}");
     }
     let mut child = ssh_spawn(remote, &cmd)?;
     let r = run_sink_with_listener(
         listener, local_dst, streams, wnd, check, progress, crypt, key, resume, json,
     );
-    let _ = child.wait();
-    r
+    finish_agent(&mut child, r, "pull remote source")
 }
 
 fn cp_pull_reverse(
@@ -772,8 +887,10 @@ fn cp_pull_reverse(
     crypt: bool,
     resume: bool,
     json: bool,
+    port_range: Option<(u16, u16)>,
 ) -> Result<(), String> {
     let ce = ce_flags(check, crypt);
+    let z = z_flag(port_range);
     let rf = if resume {
         std::fs::metadata(local_dst).map(|m| m.len()).unwrap_or(0)
     } else {
@@ -785,7 +902,7 @@ fn cp_pull_reverse(
         String::new()
     };
     let cmd = format!(
-        "{} source -l 0.0.0.0:0 -i {} -s {streams} -w {wnd} {ce}{rarg}",
+        "{} source -l 0.0.0.0:0{z} -i {} -s {streams} -w {wnd} {ce}{rarg}",
         shell_quote(bin),
         shell_quote(rpath)
     );
@@ -797,8 +914,7 @@ fn cp_pull_reverse(
     }
     let r = run_sink_connect(&addr, local_dst, streams, wnd, check, crypt, key, resume, json);
     let _ = progress;
-    let _ = child.wait();
-    r
+    finish_agent(&mut child, r, "pull -z remote source")
 }
 
 fn remote_file_len(remote: &str, path: &str) -> Result<u64, String> {
@@ -825,10 +941,93 @@ fn host_only(remote: &str) -> &str {
     remote.rsplit('@').next().unwrap_or(remote)
 }
 
+/// IP the peer should dial for reverse/pull listen modes.
+/// Order: `BBX_ADVERTISE` → route toward remote host → default route UDP → non-loopback iface.
+fn advertise_ip(remote: Option<&str>) -> String {
+    if let Ok(v) = env::var("BBX_ADVERTISE") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    if let Some(r) = remote {
+        if let Some(ip) = guess_ip_toward(host_only(r)) {
+            return ip;
+        }
+    }
+    guess_local_ip()
+        .or_else(guess_ip_from_proc_route)
+        .unwrap_or_else(|| "127.0.0.1".into())
+}
+
+fn guess_ip_toward(host: &str) -> Option<String> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // Prefer SSH port; fall back to HTTPS if filtered.
+    if s.connect(format!("{host}:22")).is_err() {
+        s.connect(format!("{host}:443")).ok()?;
+    }
+    let ip = s.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
 fn guess_local_ip() -> Option<String> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("8.8.8.8:80").ok()?;
-    Some(s.local_addr().ok()?.ip().to_string())
+    let ip = s.local_addr().ok()?.ip();
+    if ip.is_loopback() {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
+/// First non-loopback IPv4 with a default route from `/proc/net/route` (Linux).
+fn guess_ip_from_proc_route() -> Option<String> {
+    let data = std::fs::read_to_string("/proc/net/route").ok()?;
+    let mut iface = None;
+    for line in data.lines().skip(1) {
+        let mut cols = line.split_whitespace();
+        let ifname = cols.next()?;
+        let dest = cols.next()?;
+        if dest == "00000000" {
+            iface = Some(ifname.to_string());
+            break;
+        }
+    }
+    let iface = iface?;
+    // /proc/net/fib_trie is heavy; use `ip -4 -o addr` if present, else hostname -I.
+    if let Ok(out) = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", &iface])
+        .output()
+    {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for part in s.split_whitespace() {
+                if let Some(cidr) = part.split('/').next() {
+                    if cidr.contains('.') && !cidr.starts_with("127.") {
+                        return Some(cidr.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Prefer transfer error; kill agent on failure; surface non-zero agent exit if transfer OK.
+fn finish_agent(child: &mut Child, transfer: Result<(), String>, role: &str) -> Result<(), String> {
+    if transfer.is_err() {
+        let _ = child.kill();
+    }
+    let st = child.wait();
+    match (transfer, st) {
+        (Err(e), _) => Err(e),
+        (Ok(()), Ok(s)) if s.success() => Ok(()),
+        (Ok(()), Ok(s)) => Err(format!("{role} exited {s}")),
+        (Ok(()), Err(e)) => Err(format!("{role} wait: {e}")),
+    }
 }
 
 // --- ssh -------------------------------------------------------------------
@@ -940,6 +1139,7 @@ fn existing_len(path: &str) -> u64 {
 
 fn run_sink_listen(
     listen: &str,
+    port_range: Option<(u16, u16)>,
     out: &str,
     streams: usize,
     wnd: usize,
@@ -955,7 +1155,7 @@ fn run_sink_listen(
         None
     };
     let have = if resume { Some(existing_len(out)) } else { None };
-    let listener = TcpListener::bind(listen).map_err(|e| e.to_string())?;
+    let listener = bind_listener(listen, port_range)?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     print_listen_banner(port, crypt, &key, have);
     run_sink_with_listener(listener, out, streams, wnd, check, 0, crypt, key, resume, json)
@@ -1191,6 +1391,7 @@ fn run_source_connect(
 
 fn run_source_listen(
     listen: &str,
+    port_range: Option<(u16, u16)>,
     input: &str,
     streams: usize,
     wnd: usize,
@@ -1206,7 +1407,7 @@ fn run_source_listen(
     } else {
         None
     };
-    let listener = TcpListener::bind(listen).map_err(|e| e.to_string())?;
+    let listener = bind_listener(listen, port_range)?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     print_listen_banner(port, crypt, &key, None);
     run_source_with_listener(
@@ -1723,5 +1924,26 @@ mod tests {
         assert!(rels.contains(&"a/b/c.txt") || rels.iter().any(|r| r.ends_with("c.txt")));
         assert!(rels.iter().any(|r| r.ends_with("root.bin")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn port_range_parse() {
+        assert_eq!(parse_port_range("50000-50010").unwrap(), (50000, 50010));
+        assert_eq!(parse_port_range("1000:1001").unwrap(), (1000, 1001));
+        assert!(parse_port_range("0-10").is_err());
+        assert!(parse_port_range("20-10").is_err());
+    }
+
+    #[test]
+    fn bind_in_range() {
+        let l = bind_ephemeral(Some((45000, 45050))).unwrap();
+        let p = l.local_addr().unwrap().port();
+        assert!((45000..=45050).contains(&p));
+    }
+
+    #[test]
+    fn listen_spec_split() {
+        assert_eq!(split_listen_spec("0.0.0.0:0").unwrap(), ("0.0.0.0".into(), 0));
+        assert_eq!(split_listen_spec("127.0.0.1:9").unwrap(), ("127.0.0.1".into(), 9));
     }
 }
