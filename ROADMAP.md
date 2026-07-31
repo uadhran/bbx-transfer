@@ -12,6 +12,7 @@ Honest split: **shipped**, **open**, **out of scope for now**.
 | **W3** | `scripts/install-remote.sh` + deploy docs |
 | **W5** | Agent kill on failure; non-zero remote exit reported; timeout docs |
 | **W4/W6** | README scope: TCP multi-stream internal tool; no crates.io |
+| **0.7.0** | Stream-id handshake (fix multi-stream reorder / decrypt / bad magic); wrong-key fail-closed test; musl-first install |
 
 Protocol: [SPEC.md](SPEC.md).
 

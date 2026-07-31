@@ -14,8 +14,9 @@ Either side may **listen** or **connect** (forward vs reverse).
 ## Streams
 
 - Exactly **N** TCP connections (N = 1..64).
-- Connection **0** is control (header + range 0 payload).
-- Connections **1..N-1** carry only their range payload.
+- **Dialer** writes `u32 LE stream_id` (0..N-1) as the first bytes on each socket; **accepter** reorders by id (TCP accept order is not stream order).
+- Stream **0** is control (header + range 0 payload).
+- Streams **1..N-1** carry only their range payload.
 - File size `S` split into N exclusive ranges (sizes differ by ≤1).
 
 ## Control header (stream 0)

@@ -95,6 +95,7 @@ Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv)
 - Sink `-c`/`-C` is advisory; verification is source-negotiated.
 - IPv6 `host:path` (`[::1]:path`) not fully supported for `cp` specs.
 - `-r` is sequential per file — not a tiny-file / metadata tool.
+- **0.7.0+ both ends:** multi-stream sockets carry a stream-id prefix (not compatible with 0.6.x peers).
 
 ## Docs
 

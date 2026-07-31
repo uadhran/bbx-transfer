@@ -424,6 +424,9 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
     let dest = f.rest[1].as_str();
     let check = if f.check_set { f.check } else { true };
     let crypt = if f.crypt_set { f.crypt } else { true };
+    // Optional fixed session key: -k or BBX_KEY. If set on push-forward, overrides the
+    // peer KEY banner (must match remote or decrypt fails closed).
+    let fixed_key = f.key.or_else(env_key);
     let bin = remote_bin();
     let s = f.streams;
     let w = f.wnd;
@@ -440,14 +443,15 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
             if recurse {
                 cp_push_tree(
                     &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, rev, pr,
+                    fixed_key,
                 )
             } else if rev {
                 cp_push_reverse(
-                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, pr,
+                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, pr, fixed_key,
                 )
             } else {
                 cp_push_forward(
-                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, pr,
+                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, pr, fixed_key,
                 )
             }
         }
@@ -456,14 +460,15 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
             if recurse {
                 cp_pull_tree(
                     &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, rev, pr,
+                    fixed_key,
                 )
             } else if rev {
                 cp_pull_reverse(
-                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, pr,
+                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, pr, fixed_key,
                 )
             } else {
                 cp_pull_forward(
-                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, pr,
+                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, pr, fixed_key,
                 )
             }
         }
@@ -620,6 +625,7 @@ fn cp_push_tree(
     json: bool,
     rev: bool,
     port_range: Option<(u16, u16)>,
+    fixed_key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let root = std::path::Path::new(local_src);
     let files = walk_local_files(root)?;
@@ -649,12 +655,12 @@ fn cp_push_tree(
         if rev {
             cp_push_reverse(
                 bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
-                resume, json, port_range,
+                resume, json, port_range, fixed_key,
             )?;
         } else {
             cp_push_forward(
                 bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
-                resume, json, port_range,
+                resume, json, port_range, fixed_key,
             )?;
         }
     }
@@ -683,6 +689,7 @@ fn cp_pull_tree(
     json: bool,
     rev: bool,
     port_range: Option<(u16, u16)>,
+    fixed_key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let files = remote_list_files(remote, rpath)?;
     if files.is_empty() {
@@ -715,12 +722,12 @@ fn cp_pull_tree(
         if rev {
             cp_pull_reverse(
                 bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
-                resume, json, port_range,
+                resume, json, port_range, fixed_key,
             )?;
         } else {
             cp_pull_forward(
                 bin, remote, &remote_file, &local_s, streams, wnd, progress, check, crypt,
-                resume, json, port_range,
+                resume, json, port_range, fixed_key,
             )?;
         }
     }
@@ -750,16 +757,24 @@ fn cp_push_forward(
     resume: bool,
     json: bool,
     port_range: Option<(u16, u16)>,
+    fixed_key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let ce = ce_flags(check, crypt);
     let z = z_flag(port_range);
+    // Remote generates KEY (banner). Local uses banner unless -k/BBX_KEY overrides.
+    // Override ≠ banner → decrypt fails closed (wrong key).
     let cmd = format!(
         "{} sink -l 0.0.0.0:0{z} -o {} -s {streams} -w {wnd} {ce}{}",
         shell_quote(bin),
         shell_quote(rpath),
         resume_flag(resume)
     );
-    let (mut child, port, key, resume_from) = ssh_start_banner(remote, &cmd, crypt, resume)?;
+    let (mut child, port, banner_key, resume_from) = ssh_start_banner(remote, &cmd, crypt, resume)?;
+    let key = if crypt {
+        Some(fixed_key.or(banner_key).ok_or("encrypt: no session key from peer")?)
+    } else {
+        None
+    };
     let host = host_only(remote);
     let addr = format!("{host}:{port}");
     if !json {
@@ -786,8 +801,8 @@ fn cp_push_reverse(
     resume: bool,
     json: bool,
     port_range: Option<(u16, u16)>,
+    fixed_key: Option<[u8; 32]>,
 ) -> Result<(), String> {
-    // resume: ask remote for existing size
     let resume_from = if resume {
         remote_file_len(remote, rpath)?
     } else {
@@ -797,10 +812,12 @@ fn cp_push_reverse(
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let advertise = advertise_ip(Some(remote));
     let addr = format!("{advertise}:{port}");
-    let key = if crypt { Some(gen_key()) } else { None };
+    let key = if crypt {
+        Some(fixed_key.unwrap_or_else(gen_key))
+    } else {
+        None
+    };
     let ce = ce_flags(check, crypt);
-    // Pass the key via env (BBX_KEY=), not `-k` on argv: env is not visible to a
-    // plain `ps` on the remote. The remote bbx picks it up when no -k is given.
     let kenv = key
         .as_ref()
         .map(|k| format!("BBX_KEY={} ", hex(k)))
@@ -837,14 +854,18 @@ fn cp_pull_forward(
     resume: bool,
     json: bool,
     port_range: Option<(u16, u16)>,
+    fixed_key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let listener = bind_ephemeral(port_range)?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let advertise = advertise_ip(Some(remote));
     let addr = format!("{advertise}:{port}");
-    let key = if crypt { Some(gen_key()) } else { None };
+    let key = if crypt {
+        Some(fixed_key.unwrap_or_else(gen_key))
+    } else {
+        None
+    };
     let ce = ce_flags(check, crypt);
-    // Key via env (BBX_KEY=), not `-k` on argv — hidden from a plain remote `ps`.
     let kenv = key
         .as_ref()
         .map(|k| format!("BBX_KEY={} ", hex(k)))
@@ -888,6 +909,7 @@ fn cp_pull_reverse(
     resume: bool,
     json: bool,
     port_range: Option<(u16, u16)>,
+    fixed_key: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let ce = ce_flags(check, crypt);
     let z = z_flag(port_range);
@@ -901,12 +923,22 @@ fn cp_pull_reverse(
     } else {
         String::new()
     };
+    let kenv = fixed_key
+        .as_ref()
+        .filter(|_| crypt)
+        .map(|k| format!("BBX_KEY={} ", hex(k)))
+        .unwrap_or_default();
     let cmd = format!(
-        "{} source -l 0.0.0.0:0{z} -i {} -s {streams} -w {wnd} {ce}{rarg}",
+        "{kenv}{} source -l 0.0.0.0:0{z} -i {} -s {streams} -w {wnd} {ce}{rarg}",
         shell_quote(bin),
         shell_quote(rpath)
     );
-    let (mut child, port, key, _) = ssh_start_banner(remote, &cmd, crypt, false)?;
+    let (mut child, port, banner_key, _) = ssh_start_banner(remote, &cmd, crypt, false)?;
+    let key = if crypt {
+        Some(fixed_key.or(banner_key).ok_or("encrypt: no session key from peer")?)
+    } else {
+        None
+    };
     let host = host_only(remote);
     let addr = format!("{host}:{port}");
     if !json {
@@ -1175,14 +1207,7 @@ fn run_sink_connect(
     if crypt && key.is_none() {
         return Err("encrypt needs -k KEY (from peer KEY line)".into());
     }
-    let dest: SocketAddr = addr.parse::<SocketAddr>().map_err(|e| e.to_string())?;
-    let mut conns = Vec::with_capacity(streams);
-    for i in 0..streams {
-        let s = TcpStream::connect_timeout(&dest, CONNECT_TIMEOUT)
-            .map_err(|e| format!("sink connect[{i}]: {e}"))?;
-        tune(&s, wnd);
-        conns.push(s);
-    }
+    let conns = dial_streams(addr, streams, wnd)?;
     finish_sink(conns, out, streams, check, 0, crypt, key, resume, json)
 }
 
@@ -1198,13 +1223,7 @@ fn run_sink_with_listener(
     resume: bool,
     json: bool,
 ) -> Result<(), String> {
-    set_accept_timeout(&listener);
-    let mut conns = Vec::with_capacity(streams);
-    for i in 0..streams {
-        let (s, _) = listener.accept().map_err(|e| accept_err("sink", i, e))?;
-        tune(&s, wnd);
-        conns.push(s);
-    }
+    let conns = accept_streams(&listener, streams, wnd, "sink")?;
     finish_sink(conns, out, streams, check, progress, crypt, key, resume, json)
 }
 
@@ -1378,14 +1397,7 @@ fn run_source_connect(
     if crypt && key.is_none() {
         return Err("encrypt needs session KEY from peer".into());
     }
-    let dest: SocketAddr = addr.parse::<SocketAddr>().map_err(|e| e.to_string())?;
-    let mut conns = Vec::with_capacity(streams);
-    for i in 0..streams {
-        let s = TcpStream::connect_timeout(&dest, CONNECT_TIMEOUT)
-            .map_err(|e| format!("source connect[{i}]: {e}"))?;
-        tune(&s, wnd);
-        conns.push(s);
-    }
+    let conns = dial_streams(addr, streams, wnd)?;
     finish_source(conns, input, streams, progress, check, crypt, key, resume_from, json)
 }
 
@@ -1427,13 +1439,7 @@ fn run_source_with_listener(
     resume_from: u64,
     json: bool,
 ) -> Result<(), String> {
-    set_accept_timeout(&listener);
-    let mut conns = Vec::with_capacity(streams);
-    for i in 0..streams {
-        let (s, _) = listener.accept().map_err(|e| accept_err("source", i, e))?;
-        tune(&s, wnd);
-        conns.push(s);
-    }
+    let conns = accept_streams(&listener, streams, wnd, "source")?;
     finish_source(conns, input, streams, progress, check, crypt, key, resume_from, json)
 }
 
@@ -1803,6 +1809,8 @@ fn io_err(stream_id: u32, op: &str, e: String) -> String {
 #[cfg(unix)]
 fn set_accept_timeout(l: &TcpListener) {
     use std::os::unix::io::AsRawFd;
+    // musl libc deprecates time_t alias; field is still the socket API type.
+    #[allow(deprecated)]
     let tv = libc::timeval {
         tv_sec: io_timeout().as_secs() as libc::time_t,
         tv_usec: 0,
@@ -1830,6 +1838,48 @@ fn accept_err(role: &str, i: usize, e: std::io::Error) -> String {
     } else {
         format!("{role} accept[{i}]: {e}")
     }
+}
+
+/// Dialer → accepter: first 4 bytes are stream id (u32 LE). Accept order is not reliable.
+fn dial_streams(addr: &str, streams: usize, wnd: usize) -> Result<Vec<TcpStream>, String> {
+    let dest: SocketAddr = addr.parse::<SocketAddr>().map_err(|e| e.to_string())?;
+    let mut conns = Vec::with_capacity(streams);
+    for i in 0..streams {
+        let mut s = TcpStream::connect_timeout(&dest, CONNECT_TIMEOUT)
+            .map_err(|e| format!("connect[{i}]: {e}"))?;
+        tune(&s, wnd);
+        write_u32(&mut s, i as u32).map_err(|e| format!("stream-id write[{i}]: {e}"))?;
+        conns.push(s);
+    }
+    Ok(conns)
+}
+
+fn accept_streams(
+    listener: &TcpListener,
+    streams: usize,
+    wnd: usize,
+    role: &str,
+) -> Result<Vec<TcpStream>, String> {
+    set_accept_timeout(listener);
+    let mut slots: Vec<Option<TcpStream>> = (0..streams).map(|_| None).collect();
+    for i in 0..streams {
+        let (mut s, _) = listener
+            .accept()
+            .map_err(|e| accept_err(role, i, e))?;
+        tune(&s, wnd);
+        let id = read_u32(&mut s).map_err(|e| format!("{role} stream-id read[{i}]: {e}"))? as usize;
+        if id >= streams {
+            return Err(format!(
+                "{role} bad stream id {id} (expected 0..{})",
+                streams.saturating_sub(1)
+            ));
+        }
+        if slots[id].is_some() {
+            return Err(format!("{role} duplicate stream id {id}"));
+        }
+        slots[id] = Some(s);
+    }
+    Ok(slots.into_iter().map(|s| s.expect("filled")).collect())
 }
 
 fn tune(s: &TcpStream, wnd: usize) {
@@ -1946,4 +1996,5 @@ mod tests {
         assert_eq!(split_listen_spec("0.0.0.0:0").unwrap(), ("0.0.0.0".into(), 0));
         assert_eq!(split_listen_spec("127.0.0.1:9").unwrap(), ("127.0.0.1".into(), 9));
     }
+
 }
