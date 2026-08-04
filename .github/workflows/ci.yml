@@ -3,6 +3,7 @@ name: ci
 on:
   push:
     branches: [master, main]
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -39,16 +40,25 @@ jobs:
           $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -c -e -k "$KEY" -P 1
           wait $SPID
           cmp /tmp/bbx-in.bin /tmp/bbx-out2.bin
-          # resume
+          # resume (requires -c / BLAKE3)
           dd if=/tmp/bbx-in.bin of=/tmp/bbx-part.bin bs=1M count=2 status=none
-          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-part.bin -s 4 -C -E -A > /tmp/bbx-port3.txt &
+          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-part.bin -s 4 -c -E -A > /tmp/bbx-port3.txt &
           SPID=$!
           for i in $(seq 1 50); do grep -q '^RESUME ' /tmp/bbx-port3.txt 2>/dev/null && break; sleep 0.05; done
           PORT=$(awk '/^PORT/{print $2; exit}' /tmp/bbx-port3.txt)
           RF=$(awk '/^RESUME/{print $2; exit}' /tmp/bbx-port3.txt)
-          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -C -E -R "$RF"
+          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 4 -c -E -R "$RF"
           wait $SPID
           cmp /tmp/bbx-in.bin /tmp/bbx-part.bin
+          # max streams (C1)
+          rm -f /tmp/bbx-out64.bin /tmp/bbx-port64.txt
+          $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-out64.bin -s 64 -C -E > /tmp/bbx-port64.txt &
+          SPID=$!
+          for i in $(seq 1 50); do test -s /tmp/bbx-port64.txt && break; sleep 0.05; done
+          PORT=$(awk '/^PORT/{print $2; exit}' /tmp/bbx-port64.txt)
+          $BIN source -a "127.0.0.1:$PORT" -i /tmp/bbx-in.bin -s 64 -C -E
+          wait $SPID
+          cmp /tmp/bbx-in.bin /tmp/bbx-out64.bin
           # empty file (must transfer, not silently skip)
           rm -f /tmp/bbx-empty.in /tmp/bbx-empty.out /tmp/bbx-porte.txt
           : > /tmp/bbx-empty.in
@@ -92,3 +102,38 @@ jobs:
           if BBX_IO_TIMEOUT_SECS=2 timeout 30 $BIN sink -l 127.0.0.1:0 -o /tmp/bbx-noconn.out -s 2 -C -E; then
             echo "expected sink to fail when no peer connects"; exit 1
           fi
+
+  # C9: publish musl static binary on version tags
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build musl release
+        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: package
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-unknown-linux-musl/release/bbx
+          STAGE=bbx-x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp "$BIN" "dist/${STAGE}"
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "$STAGE"
+          (cd dist && sha256sum "${STAGE}" "${STAGE}.tar.gz" > SHA256SUMS)
+      - name: upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/bbx-x86_64-unknown-linux-musl
+            dist/bbx-x86_64-unknown-linux-musl.tar.gz
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -74,7 +74,7 @@ On high-latency / multi-stream-friendly WAN bulk transfers of large files, **bbx
 3. **large760 rsync push** completed in ~1.6 s (~470 MiB/s): **not trusted** on this link (scp/bbx/2 GiB rsync are consistent). **Do not quote that cell.**  
 4. **bbcp** failed every cell (local helper binary missing). No bbcp comparison.  
 5. **tiny bbx encrypt** and **tiny bbx pull** had failures (decrypt / partial tree) — treat tree path as immature for pitch.  
-6. **Wrong-key encrypt** correctness check did **not** fail closed (`rc=0`) — known gap; do not claim AEAD misuse resistance in pitch until fixed.
+6. **Wrong-key encrypt** (this run): did **not** fail closed (`rc=0`). **Note (post-report):** **0.7.0+ / current code is fail-closed** (`crypt_loopback` + AEAD); do not treat this historical result as current behavior.
 
 ---
 
@@ -138,7 +138,8 @@ On high-latency / multi-stream-friendly WAN bulk transfers of large files, **bbx
 | rsync | ~1.6–1.7 s | ~3.4 s |
 | bbx `-r` | ~191 s | ~113 s |
 
-**Interpretation:** bbx recursive mode is **sequential multi-session**. Fine for a handful of large files; **wrong tool** for “millions of small files” or rsync-style trees. Pitch **honestly** with this limit.
+**Interpretation:** bbx recursive mode is **sequential multi-session**. Fine for a handful of large files; **wrong tool** for “millions of small files” or rsync-style trees. Pitch **honestly** with this limit.  
+*(Post-report: tree mid-fail mitigations — 1 stream for small files, batch remote mkdir, partial dest cleanup on sink failure.)*
 
 ---
 
@@ -147,7 +148,7 @@ On high-latency / multi-stream-friendly WAN bulk transfers of large files, **bbx
 | Test | Result | Notes |
 |------|--------|--------|
 | Bad source path | **OK** | Non-zero exit as expected |
-| Wrong encryption key on pull | **FAIL** | Transfer did not reject (`rc=0`) — fix before security claims |
+| Wrong encryption key on pull | **FAIL** (this run) | Did not reject (`rc=0`). **Fixed in 0.7.0+** — fail-closed via AEAD / `crypt_loopback` |
 | Resume `-A` after partial dest | **OK** | Full file compares equal |
 
 ---
@@ -209,7 +210,7 @@ export BBX_REMOTE=/path/to/bbx
 3. **Encryption + BLAKE3 ≈ free** vs clear on that path.  
 4. **Not rsync:** tiny-file trees are a known non-goal / weak area.  
 5. **Portable deploy** via musl binary; same version both ends.  
-6. **Honest limits:** live single-path medians; bbcp not compared; one security correctness gap (wrong key) open.
+6. **Honest limits:** live single-path medians; bbcp not compared. (Wrong-key fail-open in this run is fixed in 0.7.0+.)
 
 ---
 

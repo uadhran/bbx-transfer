@@ -13,6 +13,11 @@ Honest split: **shipped**, **open**, **out of scope for now**.
 | **W5** | Agent kill on failure; non-zero remote exit reported; timeout docs |
 | **W4/W6** | README scope: TCP multi-stream internal tool; no crates.io |
 | **0.7.0** | Stream-id handshake (fix multi-stream reorder / decrypt / bad magic); wrong-key fail-closed test; musl-first install |
+| **Sec A** | `install-remote` DEST validation; PSK+salt AEAD derive; resume requires BLAKE3; `BBX_BIND`/`BBX_PEER_ALLOW`; `BBX_ADVERTISE` validation; agent wait `BBX_AGENT_WAIT_SECS`; C12 sink `-c`/`-C` honor/warn |
+| **Sec B** | C1 max-streams 64 test; C3 sink progress reverse/connect pull; C4 `--preserve` mode+mtime; C5 rate limit `-x`; C9 GitHub Release musl binary on `v*` tags; C11 IPv6 `[host]:path`; tree `-r` 1 stream for small files + batch remote mkdir; partial dest cleanup on sink failure |
+| **Sec C** | F8 sealed control meta under crypt; stream-id PSK MAC; payload AEAD AAD binds header; cleartext non-loopback refused (`BBX_ALLOW_CLEAR=1` override) |
+| **0.8.0** | Sec A+B+C security/correctness batch; encrypt wire break vs 0.7.x |
+| **C8 partial** | Windows: `FileExt` cfg only (not full support) |
 
 Protocol: [SPEC.md](SPEC.md).
 
@@ -20,25 +25,20 @@ Protocol: [SPEC.md](SPEC.md).
 
 | ID | Item | Notes |
 |----|------|--------|
-| C1 | max-streams (64) integration test | easy |
-| C3 | Progress on sink during pull | easy |
-| C4 | `--preserve` mode+mtime | medium |
-| C5 | Rate limit `-x` | medium |
-| C8 | Windows | hard |
-| C9 | GitHub Release binary CI | easy; no crates.io |
-| C11 | IPv6 `host:path` for `cp` | medium |
-| C12 | Honor sink `-c`/`-C` or warn | easy |
+| C8 | Windows | hard; only `FileExt` cfg so far |
 
-## Explicit non-goals (now)
+## Closed — will not implement (product boundary)
 
-| ID | Item | Why |
-|----|------|-----|
-| F1 | QUIC data plane | UDP path; opposite of TCP-firewall wedge |
-| F2 | TLS/cert identity | PSK-over-SSH enough for our use |
+These were research “gaps” that are **out of product scope**, not deferred bugs:
+
+| ID | Item | Why closed |
+|----|------|------------|
+| F1 | QUIC data plane | Opposite of TCP/firewall wedge; different product |
+| F2 | TLS/cert identity | PSK-over-SSH + Sec C data-plane crypto is the model |
 | F4 | Delta/dedup | rsync/`sy` territory |
-| F5 | S3 | not this tool |
-| F6 | bbcp wire compat | different protocol by design |
-| C10 | crates.io publish | name `bbx` taken (BBCode); not a goal |
+| F5 | S3 | Not this tool |
+| F6 | bbcp wire compat | Different protocol by design |
+| C10 | crates.io publish | Name `bbx` taken (BBCode); binary releases via GitHub (C9) |
 
 ## Version
 

@@ -30,11 +30,13 @@ Or copy by hand: `scp target/release/bbx user@host:~/bin/bbx`.
 
 ## Quick remote push / pull
 
+**Copy-paste recipes:** **[USAGE.md](USAGE.md)**
+
 ```sh
 export BBX_REMOTE=/path/to/bbx   # on remote
-bbx cp -s 8 big.bin user@host:~/big.bin
-bbx cp -s 8 user@host:~/big.bin ./big.bin
-# defaults: BLAKE3 + encrypt on. Clear: -C -E
+bbx cp -s 8 -P 1 -C -E big.bin user@host:~/big.bin   # push
+bbx cp -s 8 -P 1 -C -E user@host:~/big.bin ./big.bin  # pull
+# defaults without -C -E: BLAKE3 + encrypt on
 ```
 
 ## Firewall: fixed port range
@@ -67,18 +69,22 @@ Auto-detect order: `BBX_ADVERTISE` → route toward remote host → default-rout
 |------|---------|
 | `-s N` | streams (default 4, max 64) |
 | `-w SIZE` | socket buffer hint |
-| `-P SEC` | progress interval |
+| `-P SEC` | progress interval (source and sink, including pull) |
 | `-c` / `-C` | BLAKE3 on/off (`cp` default on) |
 | `-e` / `-E` | encrypt on/off (`cp` default on) |
 | `-A` | resume partial dest |
 | `-R N` | source: resume from byte offset N |
 | `-J` | JSON progress on stdout |
-| `-r` | recursive dirs (**one session per file**, chatty for tiny files) |
+| `-r` | recursive dirs (**one session per file**; files ≤1 MiB use **1 stream**) |
+| `--preserve` / `-p` | preserve mode + mtime |
+| `-x RATE` | throttle bytes/sec (e.g. `10M`) |
 | `-z` | reverse dial |
 | `-Z LO-HI` | listen port range |
 | `-k HEX` | session key (manual; remote prefers `BBX_KEY` env) |
 
-Env: `BBX_REMOTE`, `BBX_ADVERTISE`, `BBX_KEY`, `BBX_PORT_RANGE`, `BBX_IO_TIMEOUT_SECS` (default 120).
+Env: `BBX_REMOTE`, `BBX_ADVERTISE`, `BBX_KEY`, `BBX_PORT_RANGE`, `BBX_IO_TIMEOUT_SECS` (default 120), `BBX_BIND` (listen host), `BBX_PEER_ALLOW` (comma IPs), `BBX_AGENT_WAIT_SECS` (SSH agent wait), `BBX_ALLOW_CLEAR=1` (permit non-loopback cleartext).
+
+`cp` specs: `user@host:path`, `host:path`, or IPv6 `user@[2001:db8::1]:path` / `[::1]:path`.
 
 ## Reliability
 
@@ -88,14 +94,14 @@ Env: `BBX_REMOTE`, `BBX_ADVERTISE`, `BBX_KEY`, `BBX_PORT_RANGE`, `BBX_IO_TIMEOUT
 
 ## Security
 
-Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv). Data plane AEAD when `-e`. See [SPEC.md](SPEC.md#threat-model).
+Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv). Data plane with `-e`: AEAD (PSK+salt), stream-id MAC, sealed BLAKE3/preserve meta, AAD-bound payload tags (both ends must match). Cleartext (`-E`) is **loopback-only** unless `BBX_ALLOW_CLEAR=1`. Resume (`-A`) requires BLAKE3 (`-c`). Optional: `BBX_BIND`, `BBX_PEER_ALLOW`. See [SPEC.md](SPEC.md#threat-model).
 
 ## Limitations
 
-- Sink `-c`/`-C` is advisory; verification is source-negotiated.
-- IPv6 `host:path` (`[::1]:path`) not fully supported for `cp` specs.
-- `-r` is sequential per file — not a tiny-file / metadata tool.
+- `-r` is sequential per file (batch remote `mkdir`; small files force 1 stream) — not a tiny-file / metadata tool.
 - **0.7.0+ both ends:** multi-stream sockets carry a stream-id prefix (not compatible with 0.6.x peers).
+- **0.8.0+ both ends for encrypt:** PSK+salt AEAD, stream-id MAC, sealed control meta, AAD-bound frames (not compatible with 0.7.x encrypt peers).
+- **Encrypted wire:** control header includes 32-byte salt — peers without salt support will not interoperate.
 
 ## Docs
 
