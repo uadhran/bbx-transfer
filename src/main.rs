@@ -2221,8 +2221,9 @@ fn apply_preserve(path: &str, mode: u32, mtime: u64) -> Result<(), String> {
         let perms = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(path, perms).map_err(|e| e.to_string())?;
         // utimes via libc
+        // Infer tv_sec type (avoids deprecated libc::time_t alias on musl).
         let tv = libc::timeval {
-            tv_sec: mtime as libc::time_t,
+            tv_sec: mtime as _,
             tv_usec: 0,
         };
         let times = [tv, tv];
