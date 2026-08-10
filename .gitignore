@@ -1,3 +1,4 @@
 /bench/
 .playwright-mcp/
 /target
+CODE_REVIEW.md
