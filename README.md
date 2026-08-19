@@ -101,6 +101,7 @@ Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv)
 - `-r` is sequential per file (batch remote `mkdir`; small files force 1 stream) — not a tiny-file / metadata tool.
 - **0.7.0+ both ends:** multi-stream sockets carry a stream-id prefix (not compatible with 0.6.x peers).
 - **0.8.0+ both ends for encrypt:** PSK+salt AEAD, stream-id MAC, sealed control meta, AAD-bound frames (not compatible with 0.7.x encrypt peers).
+- **0.8.1+ recommended:** fresh receive writes a temp file beside the destination, then renames after success (failed overwrite no longer destroys an existing dest). `-r` pull uses NUL-delimited remote listing; local symlink components under the dest tree are refused.
 - **Encrypted wire:** control header includes 32-byte salt — peers without salt support will not interoperate.
 
 ## Docs

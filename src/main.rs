@@ -9,6 +9,7 @@ use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
@@ -105,6 +106,22 @@ fn host_is_loopback(s: &str) -> bool {
     }
     let h = s.trim_matches(|c| c == '[' || c == ']');
     matches!(h, "127.0.0.1" | "::1" | "localhost") || h.starts_with("127.")
+}
+
+// --- transfer options (shared cp/sink/source settings) ---------------------
+
+/// Shared transfer settings threaded through orchestration helpers.
+#[derive(Clone, Copy, Debug)]
+struct TransferOpts {
+    streams: usize,
+    wnd: usize,
+    progress: u64,
+    check: bool,
+    crypt: bool,
+    resume: bool,
+    json: bool,
+    preserve: bool,
+    rate: u64,
 }
 
 // --- flags -----------------------------------------------------------------
@@ -556,54 +573,40 @@ fn cmd_cp(args: &[String]) -> Result<(), String> {
     // peer KEY banner (must match remote or decrypt fails closed).
     let fixed_key = f.key.or_else(env_key);
     let bin = remote_bin();
-    let s = f.streams;
-    let w = f.wnd;
-    let p = f.progress;
     let rev = f.reverse;
-    let resume = f.resume;
-    let json = f.json;
     let recurse = f.recurse;
     let pr = f.port_range;
-    let preserve = f.preserve;
-    let rate = f.rate_limit;
+    let opts = TransferOpts {
+        streams: f.streams,
+        wnd: f.wnd,
+        progress: f.progress,
+        check,
+        crypt,
+        resume: f.resume,
+        json: f.json,
+        preserve: f.preserve,
+        rate: f.rate_limit,
+    };
 
     match (is_remote_spec(src), is_remote_spec(dest)) {
         (false, true) => {
             let (remote, rpath) = split_host_path(dest)?;
             if recurse {
-                cp_push_tree(
-                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, rev, pr,
-                    fixed_key, preserve, rate,
-                )
+                cp_push_tree(&bin, remote, rpath, src, opts, rev, pr, fixed_key)
             } else if rev {
-                cp_push_reverse(
-                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, pr, fixed_key,
-                    preserve, rate,
-                )
+                cp_push_reverse(&bin, remote, rpath, src, opts, pr, fixed_key)
             } else {
-                cp_push_forward(
-                    &bin, remote, rpath, src, s, w, p, check, crypt, resume, json, pr, fixed_key,
-                    preserve, rate,
-                )
+                cp_push_forward(&bin, remote, rpath, src, opts, pr, fixed_key)
             }
         }
         (true, false) => {
             let (remote, rpath) = split_host_path(src)?;
             if recurse {
-                cp_pull_tree(
-                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, rev, pr,
-                    fixed_key, preserve, rate,
-                )
+                cp_pull_tree(&bin, remote, rpath, dest, opts, rev, pr, fixed_key)
             } else if rev {
-                cp_pull_reverse(
-                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, pr, fixed_key,
-                    preserve, rate,
-                )
+                cp_pull_reverse(&bin, remote, rpath, dest, opts, pr, fixed_key)
             } else {
-                cp_pull_forward(
-                    &bin, remote, rpath, dest, s, w, p, check, crypt, resume, json, pr, fixed_key,
-                    preserve, rate,
-                )
+                cp_pull_forward(&bin, remote, rpath, dest, opts, pr, fixed_key)
             }
         }
         (false, false) => Err("cp needs one remote host:path side".into()),
@@ -703,12 +706,32 @@ fn walk_local_rec(
     Ok(())
 }
 
+/// Parse `find -print0` stdout into relative paths (no trim; strip leading `./` only).
+fn parse_find_print0(stdout: &[u8]) -> Vec<String> {
+    let mut files = Vec::new();
+    for part in stdout.split(|&b| b == 0) {
+        if part.is_empty() {
+            continue;
+        }
+        let mut s = String::from_utf8_lossy(part).into_owned();
+        if let Some(rest) = s.strip_prefix("./") {
+            s = rest.to_string();
+        }
+        if s.is_empty() {
+            continue;
+        }
+        files.push(s);
+    }
+    files.sort();
+    files
+}
+
 fn remote_list_files(remote: &str, rpath: &str) -> Result<Vec<String>, String> {
-    // relative paths under rpath
+    // NUL-delimited so names may contain newlines/spaces; do not trim components.
     let out = Command::new("ssh")
         .arg(remote)
         .arg(format!(
-            "cd {} && find . -type f | sed 's|^\\./||'",
+            "cd {} && find . -type f -print0",
             shell_quote(rpath)
         ))
         .stdin(Stdio::inherit())
@@ -721,13 +744,7 @@ fn remote_list_files(remote: &str, rpath: &str) -> Result<Vec<String>, String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    files.sort();
-    Ok(files)
+    Ok(parse_find_print0(&out.stdout))
 }
 
 /// One SSH round-trip for many parents (tree push).
@@ -782,12 +799,46 @@ fn is_safe_rel(rel: &str) -> bool {
     if rel.is_empty() {
         return false;
     }
-    let p = std::path::Path::new(rel);
+    let p = Path::new(rel);
     if p.is_absolute() {
         return false;
     }
     p.components()
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// Reject symlink components under `dest_root/rel` so recursive pull cannot
+/// follow a local symlink and write outside the destination tree.
+fn dest_path_has_symlink(dest_root: &Path, rel: &str) -> Result<bool, String> {
+    use std::path::Component;
+    let mut cur = dest_root.to_path_buf();
+    // If dest root itself is a symlink, reject (writes escape the named tree).
+    if cur
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+    for c in Path::new(rel).components() {
+        match c {
+            Component::Normal(name) => {
+                cur.push(name);
+                match cur.symlink_metadata() {
+                    Ok(m) if m.file_type().is_symlink() => return Ok(true),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        // Remaining path does not exist yet — safe so far.
+                        break;
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+            Component::CurDir => {}
+            _ => return Ok(true), // unexpected after is_safe_rel
+        }
+    }
+    Ok(false)
 }
 
 /// Sequential multi-file push (one BBX2 session per file). Clear, correct, not fancy.
@@ -796,20 +847,12 @@ fn cp_push_tree(
     remote: &str,
     rpath: &str,
     local_src: &str,
-    streams: usize,
-    wnd: usize,
-    progress: u64,
-    check: bool,
-    crypt: bool,
-    resume: bool,
-    json: bool,
+    opts: TransferOpts,
     rev: bool,
     port_range: Option<(u16, u16)>,
     fixed_key: Option<[u8; 32]>,
-    preserve: bool,
-    rate: u64,
 ) -> Result<(), String> {
-    let root = std::path::Path::new(local_src);
+    let root = Path::new(local_src);
     let files = walk_local_files(root)?;
     if files.is_empty() {
         return Err("no files under source directory".into());
@@ -826,12 +869,12 @@ fn cp_push_tree(
         }
     }
     ssh_mkdir_p_many(remote, parents.iter().map(|s| s.as_str()))?;
-    if !json {
+    if !opts.json {
         eprintln!("bbx: push -r {} files → {}:{rpath}", files.len(), remote);
     }
     for (i, (local, rel)) in files.iter().enumerate() {
         let remote_file = join_remote(rpath, rel);
-        if !json {
+        if !opts.json {
             eprintln!("bbx: [{}/{}] {}", i + 1, files.len(), rel);
         } else {
             println!(
@@ -842,20 +885,15 @@ fn cp_push_tree(
             );
         }
         let local_s = local.to_string_lossy();
-        let s = streams_for_file(&local_s, streams);
+        let mut o = opts;
+        o.streams = streams_for_file(&local_s, opts.streams);
         if rev {
-            cp_push_reverse(
-                bin, remote, &remote_file, &local_s, s, wnd, progress, check, crypt, resume,
-                json, port_range, fixed_key, preserve, rate,
-            )?;
+            cp_push_reverse(bin, remote, &remote_file, &local_s, o, port_range, fixed_key)?;
         } else {
-            cp_push_forward(
-                bin, remote, &remote_file, &local_s, s, wnd, progress, check, crypt, resume,
-                json, port_range, fixed_key, preserve, rate,
-            )?;
+            cp_push_forward(bin, remote, &remote_file, &local_s, o, port_range, fixed_key)?;
         }
     }
-    if json {
+    if opts.json {
         println!(
             r#"{{"event":"tree_done","files":{},"direction":"push"}}"#,
             files.len()
@@ -871,37 +909,47 @@ fn cp_pull_tree(
     remote: &str,
     rpath: &str,
     local_dst: &str,
-    streams: usize,
-    wnd: usize,
-    progress: u64,
-    check: bool,
-    crypt: bool,
-    resume: bool,
-    json: bool,
+    opts: TransferOpts,
     rev: bool,
     port_range: Option<(u16, u16)>,
     fixed_key: Option<[u8; 32]>,
-    preserve: bool,
-    rate: u64,
 ) -> Result<(), String> {
     let files = remote_list_files(remote, rpath)?;
     if files.is_empty() {
-        return Err("no remote files found (need GNU find -printf or plain find)".into());
+        return Err("no remote files found (need find -print0)".into());
     }
-    std::fs::create_dir_all(local_dst).map_err(|e| e.to_string())?;
-    if !json {
+    let dest_root = Path::new(local_dst);
+    std::fs::create_dir_all(dest_root).map_err(|e| e.to_string())?;
+    if dest_path_has_symlink(dest_root, "")? {
+        return Err(format!(
+            "destination is a symlink (refused): {}",
+            dest_root.display()
+        ));
+    }
+    if !opts.json {
         eprintln!("bbx: pull -r {} files from {}:{rpath}", files.len(), remote);
     }
     for (i, rel) in files.iter().enumerate() {
         if !is_safe_rel(rel) {
-            return Err(format!("unsafe remote path rejected: {rel}"));
+            return Err(format!("unsafe remote path rejected: {rel:?}"));
+        }
+        if dest_path_has_symlink(dest_root, rel)? {
+            return Err(format!(
+                "refusing path with symlink under dest: {rel:?} (symlink escape)"
+            ));
         }
         let remote_file = join_remote(rpath, rel);
-        let local_file = std::path::Path::new(local_dst).join(rel);
+        let local_file = dest_root.join(rel);
         if let Some(parent) = local_file.parent() {
+            // Re-check parents after create: refuse if a parent became a symlink.
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            if dest_path_has_symlink(dest_root, rel)? {
+                return Err(format!(
+                    "refusing path with symlink under dest: {rel:?}"
+                ));
+            }
         }
-        if !json {
+        if !opts.json {
             eprintln!("bbx: [{}/{}] {}", i + 1, files.len(), rel);
         } else {
             println!(
@@ -913,20 +961,15 @@ fn cp_pull_tree(
         }
         let local_s = local_file.to_string_lossy();
         // Pull: remote size unknown cheaply; use single stream for tree stability.
-        let s = if streams > 1 { 1 } else { streams };
+        let mut o = opts;
+        o.streams = if opts.streams > 1 { 1 } else { opts.streams };
         if rev {
-            cp_pull_reverse(
-                bin, remote, &remote_file, &local_s, s, wnd, progress, check, crypt, resume,
-                json, port_range, fixed_key, preserve, rate,
-            )?;
+            cp_pull_reverse(bin, remote, &remote_file, &local_s, o, port_range, fixed_key)?;
         } else {
-            cp_pull_forward(
-                bin, remote, &remote_file, &local_s, s, wnd, progress, check, crypt, resume,
-                json, port_range, fixed_key, preserve, rate,
-            )?;
+            cp_pull_forward(bin, remote, &remote_file, &local_s, o, port_range, fixed_key)?;
         }
     }
-    if json {
+    if opts.json {
         println!(
             r#"{{"event":"tree_done","files":{},"direction":"pull"}}"#,
             files.len()
@@ -960,46 +1003,51 @@ fn cp_push_forward(
     remote: &str,
     rpath: &str,
     local_src: &str,
-    streams: usize,
-    wnd: usize,
-    progress: u64,
-    check: bool,
-    crypt: bool,
-    resume: bool,
-    json: bool,
+    opts: TransferOpts,
     port_range: Option<(u16, u16)>,
     fixed_key: Option<[u8; 32]>,
-    preserve: bool,
-    rate: u64,
 ) -> Result<(), String> {
-    let ce = ce_flags(check, crypt);
+    let ce = ce_flags(opts.check, opts.crypt);
     let z = z_flag(port_range);
-    let pf = preserve_flag(preserve);
-    let xf = rate_flag(rate);
+    let pf = preserve_flag(opts.preserve);
+    let xf = rate_flag(opts.rate);
+    let streams = opts.streams;
+    let wnd = opts.wnd;
     // Remote generates KEY (banner). Local uses banner unless -k/BBX_KEY overrides.
-    // Override ≠ banner → decrypt fails closed (wrong key).
     let cmd = format!(
         "{} sink -l 0.0.0.0:0{z} -o {} -s {streams} -w {wnd} {ce}{}{pf}{xf}",
         shell_quote(bin),
         shell_quote(rpath),
-        resume_flag(resume)
+        resume_flag(opts.resume)
     );
-    let (mut child, port, banner_key, resume_from) = ssh_start_banner(remote, &cmd, crypt, resume)?;
-    let key = if crypt {
+    let (mut child, port, banner_key, resume_from) =
+        ssh_start_banner(remote, &cmd, opts.crypt, opts.resume)?;
+    let key = if opts.crypt {
         Some(fixed_key.or(banner_key).ok_or("encrypt: no session key from peer")?)
     } else {
         None
     };
     let host = host_only(remote);
     let addr = format!("{host}:{port}");
-    if !json {
+    if !opts.json {
         eprintln!(
-            "bbx: push {local_src} → {remote}:{rpath} via {addr} streams={streams} resume_from={resume_from} crypt={crypt}"
+            "bbx: push {local_src} → {remote}:{rpath} via {addr} streams={streams} resume_from={resume_from} crypt={}",
+            opts.crypt
         );
     }
     let r = run_source_connect(
-        &addr, local_src, streams, wnd, progress, check, crypt, key, resume_from, json, preserve,
-        rate,
+        &addr,
+        local_src,
+        opts.streams,
+        opts.wnd,
+        opts.progress,
+        opts.check,
+        opts.crypt,
+        key,
+        resume_from,
+        opts.json,
+        opts.preserve,
+        opts.rate,
     );
     finish_agent(&mut child, r, "push remote sink")
 }
@@ -1009,19 +1057,11 @@ fn cp_push_reverse(
     remote: &str,
     rpath: &str,
     local_src: &str,
-    streams: usize,
-    wnd: usize,
-    progress: u64,
-    check: bool,
-    crypt: bool,
-    resume: bool,
-    json: bool,
+    opts: TransferOpts,
     port_range: Option<(u16, u16)>,
     fixed_key: Option<[u8; 32]>,
-    preserve: bool,
-    rate: u64,
 ) -> Result<(), String> {
-    let resume_from = if resume {
+    let resume_from = if opts.resume {
         remote_file_len(remote, rpath)?
     } else {
         0
@@ -1030,14 +1070,16 @@ fn cp_push_reverse(
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let advertise = advertise_ip(Some(remote));
     let addr = format!("{advertise}:{port}");
-    let key = if crypt {
+    let key = if opts.crypt {
         Some(fixed_key.unwrap_or_else(gen_key))
     } else {
         None
     };
-    let ce = ce_flags(check, crypt);
-    let pf = preserve_flag(preserve);
-    let xf = rate_flag(rate);
+    let ce = ce_flags(opts.check, opts.crypt);
+    let pf = preserve_flag(opts.preserve);
+    let xf = rate_flag(opts.rate);
+    let streams = opts.streams;
+    let wnd = opts.wnd;
     let kenv = key
         .as_ref()
         .map(|k| format!("BBX_KEY={} ", hex(k)))
@@ -1047,17 +1089,27 @@ fn cp_push_reverse(
         shell_quote(bin),
         shell_quote(&addr),
         shell_quote(rpath),
-        resume_flag(resume)
+        resume_flag(opts.resume)
     );
-    if !json {
+    if !opts.json {
         eprintln!(
             "bbx: push -z {local_src} → {remote}:{rpath} dials {addr} resume_from={resume_from}"
         );
     }
     let mut child = ssh_spawn(remote, &cmd)?;
     let r = run_source_with_listener(
-        listener, local_src, streams, wnd, progress, check, crypt, key, resume_from, json,
-        preserve, rate,
+        listener,
+        local_src,
+        opts.streams,
+        opts.wnd,
+        opts.progress,
+        opts.check,
+        opts.crypt,
+        key,
+        resume_from,
+        opts.json,
+        opts.preserve,
+        opts.rate,
     );
     finish_agent(&mut child, r, "push -z remote sink")
 }
@@ -1067,40 +1119,34 @@ fn cp_pull_forward(
     remote: &str,
     rpath: &str,
     local_dst: &str,
-    streams: usize,
-    wnd: usize,
-    progress: u64,
-    check: bool,
-    crypt: bool,
-    resume: bool,
-    json: bool,
+    opts: TransferOpts,
     port_range: Option<(u16, u16)>,
     fixed_key: Option<[u8; 32]>,
-    preserve: bool,
-    rate: u64,
 ) -> Result<(), String> {
     let listener = bind_ephemeral(port_range)?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let advertise = advertise_ip(Some(remote));
     let addr = format!("{advertise}:{port}");
-    let key = if crypt {
+    let key = if opts.crypt {
         Some(fixed_key.unwrap_or_else(gen_key))
     } else {
         None
     };
-    let ce = ce_flags(check, crypt);
-    let pf = preserve_flag(preserve);
-    let xf = rate_flag(rate);
+    let ce = ce_flags(opts.check, opts.crypt);
+    let pf = preserve_flag(opts.preserve);
+    let xf = rate_flag(opts.rate);
+    let streams = opts.streams;
+    let wnd = opts.wnd;
     let kenv = key
         .as_ref()
         .map(|k| format!("BBX_KEY={} ", hex(k)))
         .unwrap_or_default();
-    let rf = if resume {
+    let rf = if opts.resume {
         std::fs::metadata(local_dst).map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
-    let rarg = if resume && rf > 0 {
+    let rarg = if opts.resume && rf > 0 {
         format!(" -R {rf}")
     } else {
         String::new()
@@ -1111,12 +1157,22 @@ fn cp_pull_forward(
         shell_quote(&addr),
         shell_quote(rpath)
     );
-    if !json {
+    if !opts.json {
         eprintln!("bbx: pull {remote}:{rpath} → {local_dst} listen={addr} resume_from={rf}");
     }
     let mut child = ssh_spawn(remote, &cmd)?;
     let r = run_sink_with_listener(
-        listener, local_dst, streams, wnd, check, progress, crypt, key, resume, json, rate,
+        listener,
+        local_dst,
+        opts.streams,
+        opts.wnd,
+        opts.check,
+        opts.progress,
+        opts.crypt,
+        key,
+        opts.resume,
+        opts.json,
+        opts.rate,
     );
     finish_agent(&mut child, r, "pull remote source")
 }
@@ -1126,35 +1182,29 @@ fn cp_pull_reverse(
     remote: &str,
     rpath: &str,
     local_dst: &str,
-    streams: usize,
-    wnd: usize,
-    progress: u64,
-    check: bool,
-    crypt: bool,
-    resume: bool,
-    json: bool,
+    opts: TransferOpts,
     port_range: Option<(u16, u16)>,
     fixed_key: Option<[u8; 32]>,
-    preserve: bool,
-    rate: u64,
 ) -> Result<(), String> {
-    let ce = ce_flags(check, crypt);
+    let ce = ce_flags(opts.check, opts.crypt);
     let z = z_flag(port_range);
-    let pf = preserve_flag(preserve);
-    let xf = rate_flag(rate);
-    let rf = if resume {
+    let pf = preserve_flag(opts.preserve);
+    let xf = rate_flag(opts.rate);
+    let streams = opts.streams;
+    let wnd = opts.wnd;
+    let rf = if opts.resume {
         std::fs::metadata(local_dst).map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
-    let rarg = if resume && rf > 0 {
+    let rarg = if opts.resume && rf > 0 {
         format!(" -R {rf}")
     } else {
         String::new()
     };
     let kenv = fixed_key
         .as_ref()
-        .filter(|_| crypt)
+        .filter(|_| opts.crypt)
         .map(|k| format!("BBX_KEY={} ", hex(k)))
         .unwrap_or_default();
     let cmd = format!(
@@ -1162,19 +1212,29 @@ fn cp_pull_reverse(
         shell_quote(bin),
         shell_quote(rpath)
     );
-    let (mut child, port, banner_key, _) = ssh_start_banner(remote, &cmd, crypt, false)?;
-    let key = if crypt {
+    let (mut child, port, banner_key, _) = ssh_start_banner(remote, &cmd, opts.crypt, false)?;
+    let key = if opts.crypt {
         Some(fixed_key.or(banner_key).ok_or("encrypt: no session key from peer")?)
     } else {
         None
     };
     let host = host_only(remote);
     let addr = format!("{host}:{port}");
-    if !json {
+    if !opts.json {
         eprintln!("bbx: pull -z {remote}:{rpath} → {local_dst} via {addr} resume_from={rf}");
     }
     let r = run_sink_connect(
-        &addr, local_dst, streams, wnd, check, progress, crypt, key, resume, json, rate,
+        &addr,
+        local_dst,
+        opts.streams,
+        opts.wnd,
+        opts.check,
+        opts.progress,
+        opts.crypt,
+        key,
+        opts.resume,
+        opts.json,
+        opts.rate,
     );
     finish_agent(&mut child, r, "pull -z remote source")
 }
@@ -1534,11 +1594,35 @@ fn run_sink_with_listener(
     finish_sink(conns, out, streams, check, progress, crypt, key, resume, json, rate)
 }
 
-/// On failed transfer after dest was resized: remove (fresh) or shrink to trusted prefix (resume).
-fn sink_fail_cleanup(out: &str, resume_from: u64) {
-    if resume_from == 0 {
-        let _ = std::fs::remove_file(out);
-    } else if let Ok(f) = OpenOptions::new().write(true).open(out) {
+/// Fresh transfer work path: temp beside dest (same filesystem → atomic rename).
+/// Resume writes the real destination path (owns that file while `-A` is active).
+fn sink_work_path(out: &str, resume_from: u64) -> Result<(String, bool), String> {
+    if resume_from > 0 {
+        return Ok((out.to_string(), false));
+    }
+    let p = Path::new(out);
+    let parent = p
+        .parent()
+        .filter(|x| !x.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bbx.out");
+    let mut rnd = [0u8; 4];
+    getrandom::getrandom(&mut rnd).map_err(|e| e.to_string())?;
+    let tmp = parent.join(format!(
+        ".{base}.bbx.{:08x}.tmp",
+        u32::from_le_bytes(rnd)
+    ));
+    Ok((tmp.to_string_lossy().into_owned(), true))
+}
+
+/// On failed transfer: delete temp (fresh) or shrink resume dest to trusted prefix.
+fn sink_fail_cleanup(work: &str, resume_from: u64, is_temp: bool) {
+    if is_temp || resume_from == 0 {
+        let _ = std::fs::remove_file(work);
+    } else if let Ok(f) = OpenOptions::new().write(true).open(work) {
         let _ = f.set_len(resume_from);
     }
 }
@@ -1695,11 +1779,12 @@ fn finish_sink(
             ));
         }
     }
+    let (work_path, is_temp) = sink_work_path(out, resume_from)?;
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(resume_from == 0)
-        .open(out)
+        .open(&work_path)
         .map_err(|e| e.to_string())?;
     if resume_from > 0 && have > resume_from {
         file.set_len(resume_from).map_err(|e| e.to_string())?;
@@ -1768,8 +1853,18 @@ fn finish_sink(
                 eprint!("\nbbx: verifying BLAKE3… ");
                 let _ = io::stderr().flush();
             }
-            let got_hash = hash_file(out)?;
+            let got_hash = hash_file(&work_path)?;
             if got_hash != expect_hash {
+                if resume_from > 0 {
+                    return Err(format!(
+                        "checksum mismatch after resume (expected {} got {}); \
+                         local prefix is not re-checked alone — delete {} and retry a full transfer \
+                         (do not re-run -A on a corrupt partial)",
+                        hex(&expect_hash),
+                        hex(&got_hash),
+                        out
+                    ));
+                }
                 return Err(format!(
                     "checksum mismatch: expected {} got {}",
                     hex(&expect_hash),
@@ -1781,7 +1876,13 @@ fn finish_sink(
             }
         }
         if let (Some(mode), Some(mtime)) = (meta_mode, meta_mtime) {
-            apply_preserve(out, mode, mtime)?;
+            apply_preserve(&work_path, mode, mtime)?;
+        }
+        // Atomic replace of final dest only after success (fresh transfers).
+        if is_temp {
+            std::fs::rename(&work_path, out).map_err(|e| {
+                format!("rename {} → {}: {e}", work_path, out)
+            })?;
         }
         if progress > 0 {
             report_progress(size, size, t0, json);
@@ -1798,7 +1899,7 @@ fn finish_sink(
     })();
 
     if transfer.is_err() {
-        sink_fail_cleanup(out, resume_from);
+        sink_fail_cleanup(&work_path, resume_from, is_temp);
     }
     transfer
 }
@@ -2655,6 +2756,47 @@ mod tests {
         assert!(!is_safe_rel("../secrets"));
         assert!(!is_safe_rel("a/../../b"));
         assert!(!is_safe_rel(""));
+    }
+
+    #[test]
+    fn parse_find_print0_keeps_spaces_and_newlines() {
+        // "a b.txt\0dir/\nfile.txt\0" — second name contains a newline
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"./a b.txt\0");
+        raw.extend_from_slice(b"./dir/\nfile.txt\0");
+        let files = parse_find_print0(&raw);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|f| f == "a b.txt"));
+        assert!(files.iter().any(|f| f == "dir/\nfile.txt"));
+        // no trim of internal spaces
+        assert!(!files.iter().any(|f| f == "a b.txt ".trim() && f.ends_with(' ')));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dest_symlink_component_detected() {
+        let dir = std::env::temp_dir().join(format!("bbx_sym_{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("bbx_sym_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(dest_path_has_symlink(&dir, "link/file").unwrap());
+        assert!(!dest_path_has_symlink(&dir, "safe/file").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn sink_work_path_temp_for_fresh() {
+        let (p, is_temp) = sink_work_path("/tmp/bbx_dest.bin", 0).unwrap();
+        assert!(is_temp);
+        assert!(p.contains(".bbx.") && p.ends_with(".tmp"));
+        let (p2, is_temp2) = sink_work_path("/tmp/bbx_dest.bin", 100).unwrap();
+        assert!(!is_temp2);
+        assert_eq!(p2, "/tmp/bbx_dest.bin");
     }
 
     #[test]

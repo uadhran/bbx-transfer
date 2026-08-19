@@ -1,6 +1,6 @@
 [package]
 name = "bbx"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "Multi-stream bulk copy — BBX2, BLAKE3, encrypt, resume, preserve, rate limit"
 license = "MIT"

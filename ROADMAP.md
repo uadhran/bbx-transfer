@@ -17,6 +17,7 @@ Honest split: **shipped**, **open**, **out of scope for now**.
 | **Sec B** | C1 max-streams 64 test; C3 sink progress reverse/connect pull; C4 `--preserve` mode+mtime; C5 rate limit `-x`; C9 GitHub Release musl binary on `v*` tags; C11 IPv6 `[host]:path`; tree `-r` 1 stream for small files + batch remote mkdir; partial dest cleanup on sink failure |
 | **Sec C** | F8 sealed control meta under crypt; stream-id PSK MAC; payload AEAD AAD binds header; cleartext non-loopback refused (`BBX_ALLOW_CLEAR=1` override) |
 | **0.8.0** | Sec A+B+C security/correctness batch; encrypt wire break vs 0.7.x |
+| **0.8.1** | Fresh sink writes temp-then-rename (failed overwrite keeps dest); `-r` pull NUL listing; refuse symlink path components under dest |
 | **C8 partial** | Windows: `FileExt` cfg only (not full support) |
 
 Protocol: [SPEC.md](SPEC.md).

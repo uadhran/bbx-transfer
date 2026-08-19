@@ -41,7 +41,11 @@ Little-endian integers.
 
 Payload covers only `[resume_from, size)`. **Resume always sends the full control header**; only the payload range is shortened.
 
-**Resume:** `FLAG_RESUME` requires `FLAG_BLAKE3`. Sink refuses resume without BLAKE3. Local bytes past `resume_from` are truncated before receive.
+**Resume:** `FLAG_RESUME` requires `FLAG_BLAKE3`. Sink refuses resume without BLAKE3. Local bytes past `resume_from` are truncated before receive. Prefix content is not re-hashed alone; a post-transfer BLAKE3 failure after resume means the local partial is untrusted — delete the destination and retry a full transfer (do not loop `-A` on a corrupt prefix).
+
+**Fresh sink write:** the sink writes a temporary file beside the destination (same directory), verifies integrity, then renames over the final path. A failed fresh transfer does not truncate/delete a pre-existing destination.
+
+**Recursive pull paths:** remote listing uses `find -print0` (NUL-delimited). Local dest rejects symlink path components so a remote path cannot escape through a local symlink.
 
 ## Payload
 
