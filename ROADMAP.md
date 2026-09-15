@@ -19,6 +19,7 @@ Honest split: **shipped**, **open**, **out of scope for now**.
 | **0.8.0** | Sec A+B+C security/correctness batch; encrypt wire break vs 0.7.x |
 | **0.8.1** | Fresh sink writes temp-then-rename (failed overwrite keeps dest); `-r` pull NUL listing; refuse symlink path components under dest |
 | **0.9.0** | Library split (`src/lib.rs` + focused modules); external unit tests; encrypt wire still compatible with 0.8.x |
+| **1.0.0** | Stable line starts here (same codebase as ex‑0.9.0); pre-1.0 GitHub releases retired |
 | **C8 partial** | Windows: `FileExt` cfg only (not full support) |
 
 Protocol: [SPEC.md](SPEC.md).
@@ -46,5 +47,6 @@ These were research “gaps” that are **out of product scope**, not deferred b
 
 | Version | Meaning |
 |---------|---------|
-| `0.x` | Working tool; flags may grow |
-| `1.0` | Supported list freezes |
+| `1.0.z` | Patch: fixes / docs; no wire break |
+| `1.y.0` | Minor: features; prefer peer-compatible |
+| `2.0.0` | Major: intentional wire / upgrade-both-ends break |
