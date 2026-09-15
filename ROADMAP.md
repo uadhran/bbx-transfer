@@ -18,6 +18,7 @@ Honest split: **shipped**, **open**, **out of scope for now**.
 | **Sec C** | F8 sealed control meta under crypt; stream-id PSK MAC; payload AEAD AAD binds header; cleartext non-loopback refused (`BBX_ALLOW_CLEAR=1` override) |
 | **0.8.0** | Sec A+B+C security/correctness batch; encrypt wire break vs 0.7.x |
 | **0.8.1** | Fresh sink writes temp-then-rename (failed overwrite keeps dest); `-r` pull NUL listing; refuse symlink path components under dest |
+| **0.9.0** | Library split (`src/lib.rs` + focused modules); external unit tests; encrypt wire still compatible with 0.8.x |
 | **C8 partial** | Windows: `FileExt` cfg only (not full support) |
 
 Protocol: [SPEC.md](SPEC.md).
