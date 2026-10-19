@@ -69,7 +69,7 @@ Auto-detect order: `BBX_ADVERTISE` → route toward remote host → default-rout
 |------|---------|
 | `-s N` | streams (default 4, max 64) |
 | `-w SIZE` | socket buffer hint |
-| `-P SEC` | progress interval (source and sink, including pull) |
+| `-P SEC` | progress (`SEC`>0 enables; TTY uses indicatif bar; `-J` uses JSON every `SEC`s) |
 | `-c` / `-C` | BLAKE3 on/off (`cp` default on) |
 | `-e` / `-E` | encrypt on/off (`cp` default on) |
 | `-A` | resume partial dest |
@@ -100,6 +100,7 @@ Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv)
 
 - `-r` is sequential per file (batch remote `mkdir`; small files force 1 stream) — not a tiny-file / metadata tool.
 - **1.0.0+ both ends for encrypt:** stream-id prefix + PSK/salt AEAD, stream-id MAC, sealed control meta, AAD-bound frames. Fresh receive is temp-then-rename; `-r` pull uses NUL listing; symlink path components under dest are refused. Implementation is a library crate under `src/`.
+- **1.0.1:** `-P` on a TTY uses an indicatif progress bar (`-J` JSON unchanged).
 - **Encrypted wire:** control header includes 32-byte salt — peers without this framing will not interoperate.
 
 ## Docs

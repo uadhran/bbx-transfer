@@ -5,13 +5,14 @@ use crate::crypto::{aead_decrypt, aead_encrypt, derive_aead_key, frame_aad, gen_
 use crate::frames::{apply_preserve, file_mode_mtime, recv_range, send_range};
 use crate::net::{accept_streams, bind_listener, cleartext_allowed, dial_streams};
 use crate::util::{read_u32, read_u64, split_ranges, write_u32, write_u64};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub(crate) fn print_listen_banner(port: u16, crypt: bool, key: &Option<[u8; 32]>, resume_from: Option<u64>) {
@@ -317,17 +318,8 @@ pub(crate) fn finish_sink(
         let key = aead_key.map(Arc::new);
         let aad = frame_aad_bytes.map(Arc::new);
         let rate_start = Instant::now();
-        if progress > 0 {
-            let g = Arc::clone(&got);
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(progress.max(1)));
-                let n = g.load(Ordering::Relaxed);
-                report_progress(n, size, t0, json);
-                if n >= size {
-                    break;
-                }
-            });
-        }
+        let (pb, prog_stop, prog_thr) =
+            start_progress(Arc::clone(&got), size, progress, json, t0);
 
         let abort = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
@@ -358,13 +350,22 @@ pub(crate) fn finish_sink(
                 r
             }));
         }
-        for h in handles {
-            h.join().map_err(|_| "thread panic".to_string())??;
+        let join_r = (|| -> Result<(), String> {
+            for h in handles {
+                h.join().map_err(|_| "thread panic".to_string())??;
+            }
+            Ok(())
+        })();
+        if join_r.is_err() {
+            stop_progress(pb, &prog_stop, prog_thr);
+            join_r?;
+        } else {
+            // Finish bar before verify messages so stderr stays readable.
+            finish_progress(pb, &prog_stop, prog_thr, size, t0, json);
         }
-
         if let Some(expect_hash) = expect_hash {
             if !json {
-                eprint!("\nbbx: verifying BLAKE3… ");
+                eprint!("bbx: verifying BLAKE3… ");
                 let _ = io::stderr().flush();
             }
             let got_hash = hash_file(&work_path)?;
@@ -397,12 +398,6 @@ pub(crate) fn finish_sink(
             std::fs::rename(&work_path, out).map_err(|e| {
                 format!("rename {} → {}: {e}", work_path, out)
             })?;
-        }
-        if progress > 0 {
-            report_progress(size, size, t0, json);
-            if !json {
-                eprintln!();
-            }
         }
         if json {
             println!(
@@ -620,17 +615,8 @@ pub(crate) fn finish_source(
     let key = aead_key.map(Arc::new);
     let aad = frame_aad_bytes.map(Arc::new);
 
-    if progress > 0 {
-        let sent_p = Arc::clone(&sent);
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_secs(progress.max(1)));
-            let n = sent_p.load(Ordering::Relaxed);
-            report_progress(n, size, t0, json);
-            if n >= size {
-                break;
-            }
-        });
-    }
+    let (pb, prog_stop, prog_thr) =
+        start_progress(Arc::clone(&sent), size, progress, json, t0);
 
     let abort = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
@@ -661,10 +647,17 @@ pub(crate) fn finish_source(
             r
         }));
     }
-    for h in handles {
-        h.join().map_err(|_| "thread panic".to_string())??;
+    let body = (|| -> Result<(), String> {
+        for h in handles {
+            h.join().map_err(|_| "thread panic".to_string())??;
+        }
+        Ok(())
+    })();
+    match &body {
+        Ok(()) => finish_progress(pb, &prog_stop, prog_thr, size, t0, json),
+        Err(_) => stop_progress(pb, &prog_stop, prog_thr),
     }
-    report_progress(size, size, t0, json);
+    body?;
     let elapsed = t0.elapsed().as_secs_f64().max(0.001);
     if json {
         println!(
@@ -673,7 +666,7 @@ pub(crate) fn finish_source(
         );
     } else {
         eprintln!(
-            "\nbbx: done {} bytes in {:.2}s ({:.1} MB/s){}{}",
+            "bbx: done {} bytes in {:.2}s ({:.1} MB/s){}{}",
             size,
             elapsed,
             size as f64 / elapsed / 1024.0 / 1024.0,
@@ -688,36 +681,110 @@ pub(crate) fn finish_source(
     Ok(())
 }
 
-pub(crate) fn report_progress(n: u64, size: u64, t0: Instant, json: bool) {
+fn make_progress_bar(size: u64, initial: u64) -> ProgressBar {
+    let pb = ProgressBar::new(size);
+    pb.set_position(initial);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "bbx: [{bar:24.cyan/blue}] {percent:>3}%  {bytes_per_sec}  ETA {eta}",
+        )
+        .expect("progress template")
+        .progress_chars("##-"),
+    );
+    pb
+}
+
+/// `-J`: JSON on the `-P` interval. Else: indicatif bar (~4 updates/s while `-P` > 0).
+fn start_progress(
+    counter: Arc<AtomicU64>,
+    size: u64,
+    interval_secs: u64,
+    json: bool,
+    t0: Instant,
+) -> (Option<ProgressBar>, Arc<AtomicBool>, Option<JoinHandle<()>>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    if interval_secs == 0 {
+        return (None, stop, None);
+    }
     if json {
-        let elapsed = t0.elapsed().as_secs_f64().max(0.001);
-        let rate = (n as f64 / elapsed) / (1024.0 * 1024.0);
-        println!(
-            r#"{{"event":"progress","bytes":{n},"total":{size},"rate_mbps":{rate:.3}}}"#
-        );
+        let stop_t = Arc::clone(&stop);
+        let thr = thread::spawn(move || loop {
+            if stop_t.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_secs(interval_secs.max(1)));
+            if stop_t.load(Ordering::Relaxed) {
+                break;
+            }
+            let n = counter.load(Ordering::Relaxed);
+            // Final 100% JSON line comes from finish_progress only.
+            if n >= size {
+                break;
+            }
+            report_progress_json(n, size, t0);
+        });
+        (None, stop, Some(thr))
     } else {
-        eprint_progress(n, size, t0);
+        let pb = make_progress_bar(size, counter.load(Ordering::Relaxed));
+        let pb2 = pb.clone();
+        let stop_t = Arc::clone(&stop);
+        let thr = thread::spawn(move || loop {
+            if stop_t.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+            if stop_t.load(Ordering::Relaxed) {
+                break;
+            }
+            let n = counter.load(Ordering::Relaxed);
+            // Leave 100% draw to finish_progress — avoids a duplicate final line.
+            if n >= size {
+                break;
+            }
+            // Skip if main already finished — set_position on a finished bar force-redraws.
+            if pb2.is_finished() {
+                break;
+            }
+            pb2.set_position(n);
+        });
+        (Some(pb), stop, Some(thr))
     }
 }
 
-pub(crate) fn eprint_progress(n: u64, size: u64, t0: Instant) {
+fn join_progress(stop: &AtomicBool, thr: Option<JoinHandle<()>>) {
+    stop.store(true, Ordering::Relaxed);
+    if let Some(t) = thr {
+        let _ = t.join();
+    }
+}
+
+fn stop_progress(pb: Option<ProgressBar>, stop: &AtomicBool, thr: Option<JoinHandle<()>>) {
+    join_progress(stop, thr);
+    if let Some(pb) = pb {
+        pb.set_draw_target(ProgressDrawTarget::hidden());
+        pb.abandon();
+    }
+}
+
+fn finish_progress(
+    pb: Option<ProgressBar>,
+    stop: &AtomicBool,
+    thr: Option<JoinHandle<()>>,
+    size: u64,
+    t0: Instant,
+    json: bool,
+) {
+    // Join updater first so it cannot set_position after finish() (that force-redraws).
+    join_progress(stop, thr);
+    if json {
+        report_progress_json(size, size, t0);
+    } else if let Some(pb) = pb {
+        pb.finish();
+    }
+}
+
+fn report_progress_json(n: u64, size: u64, t0: Instant) {
     let elapsed = t0.elapsed().as_secs_f64().max(0.001);
-    let pct = if size == 0 {
-        100.0
-    } else {
-        (n as f64 / size as f64) * 100.0
-    };
-    let rate = n as f64 / elapsed / 1024.0 / 1024.0;
-    let filled = ((pct / 100.0) * 24.0).round() as usize;
-    let bar: String = std::iter::repeat_n('#', filled.min(24))
-        .chain(std::iter::repeat_n('-', 24usize.saturating_sub(filled)))
-        .collect();
-    let eta = if rate > 0.01 && n < size {
-        let left = (size - n) as f64 / (rate * 1024.0 * 1024.0);
-        format!(" ETA {left:.0}s")
-    } else {
-        String::new()
-    };
-    eprint!("\rbbx: [{bar}] {pct:5.1}%  {rate:5.1} MB/s{eta}    ");
-    let _ = io::stderr().flush();
+    let rate = (n as f64 / elapsed) / (1024.0 * 1024.0);
+    println!(r#"{{"event":"progress","bytes":{n},"total":{size},"rate_mbps":{rate:.3}}}"#);
 }
