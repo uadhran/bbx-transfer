@@ -108,7 +108,11 @@ Peer dial address host part:
 ### Bind / accept hardening
 
 - `BBX_BIND` — host for ephemeral `cp` listeners (default `0.0.0.0`).
-- `BBX_PEER_ALLOW` — optional comma-separated peer IPs; when set, other accept peers are rejected.
+- `BBX_PEER_ALLOW` — comma-separated peer IPs. Only the literal `any` allows every peer. An empty value is ignored. Any other non-empty value replaces the default, and a token that is not an IP is an error.
+- `BBX_PEER_DEFAULT=ssh` — allow only the client address in `SSH_CONNECTION`. Missing or non-IP values fail closed. A comma-separated IP list is also accepted. Empty is ignored.
+- `bbx cp` sends `BBX_PEER_DEFAULT=ssh` to a remote listener unless local `BBX_PEER_ALLOW=any`. A local IP list is not copied to the remote. When `bbx cp` listens locally and neither variable is set, it allows the resolved addresses of the remote host. If that name does not resolve, an encrypted transfer warns and allows any peer; cleartext fails before accept.
+- The accept handshake is unchanged: little-endian `u32` stream id, plus a 16-byte MAC when encrypting. A failed handshake is discarded. The handshake read times out after 5s. 32 rejected connections stop the listener. The overall accept deadline stays `BBX_IO_TIMEOUT_SECS`.
+- A rejected address is logged with `set BBX_PEER_ALLOW=any, or add <ip> to BBX_PEER_ALLOW`.
 
 ## Threat model
 
@@ -124,6 +128,12 @@ Peer dial address host part:
 - Data sockets have a read/write timeout; connect and `accept()` are bounded too
   (default 120s, override with `BBX_IO_TIMEOUT_SECS`). A stalled or dead peer fails
   the transfer instead of hanging, and a failing stream aborts its siblings.
+- A stream handshake read times out after 5s and that connection is dropped. 32 such
+  rejections stop the listener. Otherwise the listener waits out `BBX_IO_TIMEOUT_SECS`.
+- `cp` pull and `cp` push `-z` poll the SSH child only when `accept()` times out with
+  nothing queued. If that child has exited, accepting stops and the error includes the
+  last rejection. Queued connections from a peer that already exited are still accepted.
+  Manual `sink` / `source` do not poll an SSH child.
 - SSH agent wait after transfer is bounded (`BBX_AGENT_WAIT_SECS`, default same as IO timeout);
   timeout kills the local `ssh` child.
 - `-x RATE` throttles payload send/recv to about RATE bytes/sec (local only; not on the wire).

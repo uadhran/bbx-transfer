@@ -51,6 +51,7 @@ fn failed_crypt_overwrite_keeps_old_dest() {
     let wrong_hex = hex32(&wrong);
 
     let mut sink = Command::new(bbx())
+        .env("BBX_IO_TIMEOUT_SECS", "2")
         .args([
             "sink",
             "-l",

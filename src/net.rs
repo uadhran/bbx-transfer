@@ -2,12 +2,12 @@
 
 use crate::{CONNECT_TIMEOUT, IO_TIMEOUT_SECS, SID_TAG_LEN};
 use crate::crypto::stream_id_tag;
-use crate::util::{read_u32, write_u32};
+use crate::util::write_u32;
 use std::env;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Cleartext (-E) is loopback-only unless `BBX_ALLOW_CLEAR=1`.
 pub(crate) fn cleartext_allowed(hostish: &str) -> Result<(), String> {
@@ -233,16 +233,22 @@ pub(crate) fn io_err(stream_id: u32, op: &str, e: String) -> String {
     }
 }
 
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_HANDSHAKE_REJECTS: u32 = 32;
+/// How often a cp listener rechecks the SSH child while accept() is idle.
+const AGENT_POLL: Duration = Duration::from_secs(1);
+
 /// Bound `accept()` so a listening side with no dialer doesn't block forever.
 /// SO_RCVTIMEO makes accept() return WouldBlock after the timeout on Unix.
+/// A zero timeval means "block forever" on Linux, so callers must pass a non-zero timeout.
 #[cfg(unix)]
-pub(crate) fn set_accept_timeout(l: &TcpListener) {
+pub(crate) fn set_accept_timeout(l: &TcpListener, timeout: Duration) {
     use std::os::unix::io::AsRawFd;
     // musl libc deprecates time_t alias; field is still the socket API type.
     #[allow(deprecated)]
     let tv = libc::timeval {
-        tv_sec: io_timeout().as_secs() as libc::time_t,
-        tv_usec: 0,
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
     };
     unsafe {
         libc::setsockopt(
@@ -256,17 +262,22 @@ pub(crate) fn set_accept_timeout(l: &TcpListener) {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn set_accept_timeout(_l: &TcpListener) {}
+pub(crate) fn set_accept_timeout(_l: &TcpListener, _timeout: Duration) {}
 
-pub(crate) fn accept_err(role: &str, i: usize, e: std::io::Error) -> String {
-    use std::io::ErrorKind::{TimedOut, WouldBlock};
-    if matches!(e.kind(), WouldBlock | TimedOut) {
+pub(crate) fn accept_err(
+    role: &str,
+    e: std::io::Error,
+    filled: usize,
+    streams: usize,
+    rejected: u32,
+) -> String {
+    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
         format!(
-            "{role} accept[{i}] timed out after {}s (no peer connected)",
+            "{role} accept timed out after {}s ({filled}/{streams} streams, {rejected} rejected)",
             io_timeout().as_secs()
         )
     } else {
-        format!("{role} accept[{i}]: {e}")
+        format!("{role} accept: {e}")
     }
 }
 
@@ -294,29 +305,208 @@ pub(crate) fn dial_streams(
     Ok(conns)
 }
 
-/// Optional peer allowlist from `BBX_PEER_ALLOW` (comma-separated IPs). Empty = any peer.
-pub(crate) fn peer_allowlist() -> Option<Vec<std::net::IpAddr>> {
-    let v = env::var("BBX_PEER_ALLOW").ok()?;
+fn env_nonempty(name: &str) -> Option<String> {
+    let v = env::var(name).ok()?;
     let v = v.trim();
     if v.is_empty() {
-        return None;
+        None
+    } else {
+        Some(v.to_string())
     }
+}
+
+fn parse_ip_list(name: &str, v: &str) -> Result<Vec<IpAddr>, String> {
     let mut out = Vec::new();
     for part in v.split(',') {
         let p = part.trim();
         if p.is_empty() {
             continue;
         }
-        match p.parse::<std::net::IpAddr>() {
-            Ok(ip) => out.push(ip),
-            Err(_) => eprintln!("bbx: warning: BBX_PEER_ALLOW skip bad IP {p:?}"),
-        }
+        let ip: IpAddr = p.parse().map_err(|_| format!("{name} bad IP {p:?}"))?;
+        out.push(ip);
     }
     if out.is_empty() {
-        None
+        Err(format!("{name} has no IP addresses"))
     } else {
-        Some(out)
+        Ok(out)
     }
+}
+
+fn ssh_client_ip() -> Result<IpAddr, String> {
+    let v = env::var("SSH_CONNECTION").map_err(|_| {
+        "BBX_PEER_DEFAULT=ssh but SSH_CONNECTION is not set".to_string()
+    })?;
+    let ip = v.split_whitespace().next().unwrap_or("");
+    ip.parse::<IpAddr>().map_err(|_| {
+        format!("BBX_PEER_DEFAULT=ssh but SSH_CONNECTION client address is not an IP: {ip:?}")
+    })
+}
+
+fn same_ip(a: IpAddr, b: IpAddr) -> bool {
+    fn canon(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+            other => other,
+        }
+    }
+    canon(a) == canon(b)
+}
+
+/// `None` allows any peer. Only the literal `BBX_PEER_ALLOW=any` opens the listener;
+/// an empty value is unset. Otherwise `BBX_PEER_DEFAULT=ssh` or a comma-separated IP list.
+pub(crate) fn peer_allowlist() -> Result<Option<Vec<IpAddr>>, String> {
+    if let Some(v) = env_nonempty("BBX_PEER_ALLOW") {
+        if v == "any" {
+            return Ok(None);
+        }
+        return Ok(Some(parse_ip_list("BBX_PEER_ALLOW", &v)?));
+    }
+    if let Some(v) = env_nonempty("BBX_PEER_DEFAULT") {
+        if v == "ssh" {
+            return Ok(Some(vec![ssh_client_ip()?]));
+        }
+        return Ok(Some(parse_ip_list("BBX_PEER_DEFAULT", &v)?));
+    }
+    Ok(None)
+}
+
+fn resolve_peer_ips(host: &str) -> Result<Vec<IpAddr>, String> {
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if host.is_empty() {
+        return Err("empty host".into());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![ip]);
+    }
+    let spec = if host.contains(':') {
+        format!("[{host}]:0")
+    } else {
+        format!("{host}:0")
+    };
+    let mut ips = Vec::new();
+    for sa in spec.to_socket_addrs().map_err(|e| e.to_string())? {
+        let ip = sa.ip();
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    if ips.is_empty() {
+        Err("no addresses".into())
+    } else {
+        Ok(ips)
+    }
+}
+
+/// Advertised dial address when it is an IP literal.
+/// A set `BBX_ADVERTISE` that does not parse as an IP is not added, and is not
+/// replaced by a route guess.
+fn extra_loopback_peer(remote: &str) -> Option<IpAddr> {
+    if let Some(v) = env_nonempty("BBX_ADVERTISE") {
+        return v.parse().ok();
+    }
+    advertise_ip(Some(remote)).parse().ok()
+}
+
+/// When `cp` listens locally, default the allowlist to the remote host's addresses.
+/// A loopback host also allows an advertised IP literal.
+/// DNS failure: encrypted sessions warn and allow any peer; cleartext fails closed.
+pub(crate) fn ensure_local_peer_default(remote: &str, crypt: bool) -> Result<(), String> {
+    if env_nonempty("BBX_PEER_ALLOW").is_some() || env_nonempty("BBX_PEER_DEFAULT").is_some() {
+        return Ok(());
+    }
+    let host = host_only(remote);
+    match resolve_peer_ips(host) {
+        Ok(mut ips) => {
+            if ips.iter().all(|ip| ip.is_loopback()) {
+                if let Some(extra) = extra_loopback_peer(remote) {
+                    if !ips.iter().any(|ip| same_ip(*ip, extra)) {
+                        ips.push(extra);
+                    }
+                }
+            }
+            let joined = ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",");
+            // SAFETY: called on the cp main thread before transfer threads exist.
+            unsafe { env::set_var("BBX_PEER_DEFAULT", joined) };
+            Ok(())
+        }
+        Err(e) => {
+            if crypt {
+                eprintln!(
+                    "bbx: warning: could not resolve {host} for peer allowlist ({e}); allowing any peer"
+                );
+                Ok(())
+            } else {
+                Err(format!(
+                    "could not resolve {host} for peer allowlist ({e}); refusing cleartext listen"
+                ))
+            }
+        }
+    }
+}
+
+fn read_handshake(s: &mut TcpStream, streams: usize, psk: Option<&[u8; 32]>) -> Result<usize, String> {
+    let mut buf = [0u8; 4];
+    match s.read_exact(&mut buf) {
+        Ok(()) => {}
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            return Err("handshake timed out".into());
+        }
+        Err(e) => return Err(format!("stream-id read: {e}")),
+    }
+    let id = u32::from_le_bytes(buf) as usize;
+    if id >= streams {
+        return Err(format!("bad stream id {id}"));
+    }
+    if let Some(k) = psk {
+        let mut tag = [0u8; SID_TAG_LEN];
+        match s.read_exact(&mut tag) {
+            Ok(()) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err("handshake timed out".into());
+            }
+            Err(e) => return Err(format!("stream-id mac read: {e}")),
+        }
+        let expect = stream_id_tag(k, id as u32);
+        if tag != expect {
+            return Err(format!("bad stream-id MAC for id {id}"));
+        }
+    }
+    Ok(id)
+}
+
+fn note_reject(
+    role: &str,
+    ip: IpAddr,
+    reason: &str,
+    rejected: &mut u32,
+    last: &mut String,
+) -> Result<(), String> {
+    eprintln!("bbx: {role} rejected {ip}: {reason}");
+    *rejected += 1;
+    *last = format!("{ip}: {reason}");
+    if *rejected >= MAX_HANDSHAKE_REJECTS {
+        Err(format!(
+            "{role} rejected {MAX_HANDSHAKE_REJECTS} connections; last {last}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn deadline_err(role: &str, filled: usize, streams: usize, rejected: u32) -> String {
+    format!(
+        "{role} accept timed out after {}s ({filled}/{streams} streams, {rejected} rejected)",
+        io_timeout().as_secs()
+    )
+}
+
+fn remain_expired(left: Duration) -> bool {
+    // Linux: SO_RCVTIMEO of zero waits forever, so a sub-microsecond remainder is expired.
+    left.as_secs() == 0 && left.subsec_micros() == 0
+}
+
+fn accept_timed_out(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 pub(crate) fn accept_streams(
@@ -325,43 +515,82 @@ pub(crate) fn accept_streams(
     wnd: usize,
     role: &str,
     psk: Option<&[u8; 32]>,
+    mut agent_gone: Option<&mut dyn FnMut() -> Option<String>>,
 ) -> Result<Vec<TcpStream>, String> {
-    set_accept_timeout(listener);
-    let allow = peer_allowlist();
+    let deadline = Instant::now() + io_timeout();
+    let allow = peer_allowlist()?;
     let mut slots: Vec<Option<TcpStream>> = (0..streams).map(|_| None).collect();
-    for i in 0..streams {
-        let (mut s, peer) = listener
-            .accept()
-            .map_err(|e| accept_err(role, i, e))?;
+    let mut filled = 0usize;
+    let mut rejected = 0u32;
+    let mut last_reject = String::new();
+    while filled < streams {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if remain_expired(left) {
+            return Err(deadline_err(role, filled, streams, rejected));
+        }
+        let wait = if agent_gone.is_some() {
+            AGENT_POLL.min(left)
+        } else {
+            left
+        };
+        if remain_expired(wait) {
+            return Err(deadline_err(role, filled, streams, rejected));
+        }
+        set_accept_timeout(listener, wait);
+        let (mut s, peer) = match listener.accept() {
+            Ok(v) => v,
+            Err(e) if accept_timed_out(&e) => {
+                // Only an idle accept. A queued connection returns Ok and must be taken.
+                let agent_msg = match agent_gone.as_mut() {
+                    Some(gone) => gone(),
+                    None => None,
+                };
+                if let Some(msg) = agent_msg {
+                    return Err(if last_reject.is_empty() {
+                        msg
+                    } else {
+                        format!("{msg}; last {last_reject}")
+                    });
+                }
+                let left_now = deadline.saturating_duration_since(Instant::now());
+                if agent_gone.is_none() || remain_expired(left_now) {
+                    return Err(deadline_err(role, filled, streams, rejected));
+                }
+                continue;
+            }
+            Err(e) => return Err(accept_err(role, e, filled, streams, rejected)),
+        };
+        let ip = peer.ip();
         if let Some(ref allow) = allow {
-            let ip = peer.ip();
-            if !allow.iter().any(|a| *a == ip) {
-                return Err(format!(
-                    "{role} reject peer {ip} (not in BBX_PEER_ALLOW)"
-                ));
+            if !allow.iter().any(|a| same_ip(*a, ip)) {
+                let reason = format!(
+                    "not in peer allowlist (set BBX_PEER_ALLOW=any, or add {ip} to BBX_PEER_ALLOW)"
+                );
+                note_reject(role, ip, &reason, &mut rejected, &mut last_reject)?;
+                continue;
             }
         }
-        tune(&s, wnd);
-        let id = read_u32(&mut s).map_err(|e| format!("{role} stream-id read[{i}]: {e}"))? as usize;
-        if id >= streams {
-            return Err(format!(
-                "{role} bad stream id {id} (expected 0..{})",
-                streams.saturating_sub(1)
-            ));
-        }
-        if let Some(k) = psk {
-            let mut tag = [0u8; SID_TAG_LEN];
-            s.read_exact(&mut tag)
-                .map_err(|e| format!("{role} stream-id mac read[{i}]: {e}"))?;
-            let expect = stream_id_tag(k, id as u32);
-            if tag != expect {
-                return Err(format!("{role} bad stream-id MAC for id {id}"));
+        let _ = s.set_read_timeout(Some(HANDSHAKE_TIMEOUT.min(left)));
+        match read_handshake(&mut s, streams, psk) {
+            Ok(id) => {
+                if slots[id].is_some() {
+                    note_reject(
+                        role,
+                        ip,
+                        &format!("duplicate stream id {id}"),
+                        &mut rejected,
+                        &mut last_reject,
+                    )?;
+                    continue;
+                }
+                tune(&s, wnd);
+                slots[id] = Some(s);
+                filled += 1;
+            }
+            Err(reason) => {
+                note_reject(role, ip, &reason, &mut rejected, &mut last_reject)?;
             }
         }
-        if slots[id].is_some() {
-            return Err(format!("{role} duplicate stream id {id}"));
-        }
-        slots[id] = Some(s);
     }
     Ok(slots.into_iter().map(|s| s.expect("filled")).collect())
 }

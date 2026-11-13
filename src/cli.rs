@@ -13,7 +13,7 @@ pub fn usage(code: i32) {
                --preserve mode+mtime  -x RATE  throttle bytes/sec\n\
          cp defaults: -c -e on. -A resumes partial dest.\n\
          BBX_REMOTE=  BBX_ADVERTISE=  BBX_KEY=  BBX_PORT_RANGE=  BBX_IO_TIMEOUT_SECS=\n\
-         BBX_BIND=  BBX_PEER_ALLOW=  BBX_AGENT_WAIT_SECS=  BBX_ALLOW_CLEAR=1\n"
+         BBX_BIND=  BBX_PEER_ALLOW=any  BBX_PEER_DEFAULT=ssh  BBX_AGENT_WAIT_SECS=  BBX_ALLOW_CLEAR=1\n"
     );
     std::process::exit(code);
 }

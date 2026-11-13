@@ -1,9 +1,14 @@
 //! In-crate unit tests for internal helpers.
+use std::io::Write;
+
 use crate::cli::{parse_key, parse_port_range};
 use crate::commands::{is_remote_spec, split_host_path};
 use crate::crypto::{aead_decrypt, aead_encrypt, derive_aead_key, frame_aad, gen_key, hex, stream_id_tag};
 use crate::engine::sink_work_path;
-use crate::net::{bind_ephemeral, cleartext_allowed, split_listen_spec, validate_advertise};
+use crate::net::{
+    accept_streams, bind_ephemeral, cleartext_allowed, ensure_local_peer_default, peer_allowlist,
+    split_listen_spec, validate_advertise,
+};
 use crate::tree::{dest_path_has_symlink, is_safe_rel, parse_find_print0, walk_local_files};
 use crate::util::split_ranges;
 
@@ -172,4 +177,97 @@ fn bind_in_range() {
 fn listen_spec_split() {
     assert_eq!(split_listen_spec("0.0.0.0:0").unwrap(), ("0.0.0.0".into(), 0));
     assert_eq!(split_listen_spec("127.0.0.1:9").unwrap(), ("127.0.0.1".into(), 9));
+}
+
+fn without_peer_env<T>(f: impl FnOnce() -> T) -> T {
+    let prev_allow = std::env::var("BBX_PEER_ALLOW").ok();
+    let prev_default = std::env::var("BBX_PEER_DEFAULT").ok();
+    unsafe {
+        std::env::remove_var("BBX_PEER_ALLOW");
+        std::env::remove_var("BBX_PEER_DEFAULT");
+    }
+    let out = f();
+    restore_env("BBX_PEER_ALLOW", prev_allow);
+    restore_env("BBX_PEER_DEFAULT", prev_default);
+    out
+}
+
+fn restore_env(key: &str, prev: Option<String>) {
+    unsafe {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+}
+
+#[test]
+fn accept_stops_when_agent_gone_and_idle() {
+    without_peer_env(|| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = std::time::Instant::now();
+        let mut gone = || Some("remote source exited exit status: 1".to_string());
+        let err = accept_streams(&listener, 2, 64 * 1024, "sink", None, Some(&mut gone))
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.contains("remote source exited exit status: 1"), "{err}");
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    });
+}
+
+#[test]
+fn accept_queued_streams_when_agent_already_gone() {
+    without_peer_env(|| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let streams = 3usize;
+        let mut clients = Vec::new();
+        for id in 0..streams {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            c.write_all(&(id as u32).to_le_bytes()).unwrap();
+            clients.push(c);
+        }
+        let mut calls = 0u32;
+        let mut gone = || {
+            calls += 1;
+            Some("remote source exited exit status: 0".to_string())
+        };
+        let conns =
+            accept_streams(&listener, streams, 64 * 1024, "sink", None, Some(&mut gone)).unwrap();
+        assert_eq!(conns.len(), streams);
+        assert_eq!(calls, 0, "queued connections must be accepted without polling the agent");
+    });
+}
+
+#[test]
+fn local_allowlist_loopback_advertise() {
+    let prev_allow = std::env::var("BBX_PEER_ALLOW").ok();
+    let prev_default = std::env::var("BBX_PEER_DEFAULT").ok();
+    let prev_adv = std::env::var("BBX_ADVERTISE").ok();
+    unsafe {
+        std::env::remove_var("BBX_PEER_ALLOW");
+        std::env::remove_var("BBX_PEER_DEFAULT");
+    }
+    let cases = [
+        ("user@127.0.0.1", "203.0.113.9", vec!["127.0.0.1", "203.0.113.9"]),
+        ("user@127.0.0.1", "files.example", vec!["127.0.0.1"]),
+        ("user@192.0.2.10", "203.0.113.9", vec!["192.0.2.10"]),
+    ];
+    let mut got = Vec::new();
+    for (remote, advertise, expect) in cases {
+        unsafe {
+            std::env::remove_var("BBX_PEER_DEFAULT");
+            std::env::set_var("BBX_ADVERTISE", advertise);
+        }
+        ensure_local_peer_default(remote, true).unwrap();
+        let allow = peer_allowlist().unwrap().expect("allowlist");
+        let expect: Vec<std::net::IpAddr> = expect.into_iter().map(|s| s.parse().unwrap()).collect();
+        got.push((allow, expect, remote, advertise));
+    }
+    restore_env("BBX_PEER_ALLOW", prev_allow);
+    restore_env("BBX_PEER_DEFAULT", prev_default);
+    restore_env("BBX_ADVERTISE", prev_adv);
+    for (allow, expect, remote, advertise) in got {
+        assert_eq!(allow, expect, "{remote} advertise={advertise}");
+    }
 }

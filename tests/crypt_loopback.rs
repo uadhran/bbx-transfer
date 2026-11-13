@@ -88,8 +88,10 @@ fn encrypt_match_ok_wrong_key_sink_fails() {
     assert!(src_st.success() && sink_st.success());
     assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&good).unwrap());
 
-    // mismatch
+    // mismatch. Short accept deadline: a wrong key is rejected, then the listener
+    // waits out BBX_IO_TIMEOUT_SECS. Manual sink has no SSH child to stop early.
     let mut sink = Command::new(bbx())
+        .env("BBX_IO_TIMEOUT_SECS", "2")
         .args([
             "sink",
             "-l",

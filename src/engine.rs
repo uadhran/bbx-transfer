@@ -58,7 +58,7 @@ pub(crate) fn run_sink_listen(
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     print_listen_banner(port, crypt, &key, have);
     run_sink_with_listener(
-        listener, out, streams, wnd, check, progress, crypt, key, resume, json, rate,
+        listener, out, streams, wnd, check, progress, crypt, key, resume, json, rate, None,
     )
 }
 
@@ -97,6 +97,7 @@ pub(crate) fn run_sink_with_listener(
     resume: bool,
     json: bool,
     rate: u64,
+    agent_gone: Option<&mut dyn FnMut() -> Option<String>>,
 ) -> Result<(), String> {
     if !crypt {
         let la = listener
@@ -105,7 +106,7 @@ pub(crate) fn run_sink_with_listener(
             .unwrap_or_default();
         cleartext_allowed(&la)?;
     }
-    let conns = accept_streams(&listener, streams, wnd, "sink", key.as_ref())?;
+    let conns = accept_streams(&listener, streams, wnd, "sink", key.as_ref(), agent_gone)?;
     finish_sink(conns, out, streams, check, progress, crypt, key, resume, json, rate)
 }
 
@@ -467,7 +468,7 @@ pub(crate) fn run_source_listen(
     print_listen_banner(port, crypt, &key, None);
     run_source_with_listener(
         listener, input, streams, wnd, progress, check, crypt, key, resume_from, json, preserve,
-        rate,
+        rate, None,
     )
 }
 
@@ -484,6 +485,7 @@ pub(crate) fn run_source_with_listener(
     json: bool,
     preserve: bool,
     rate: u64,
+    agent_gone: Option<&mut dyn FnMut() -> Option<String>>,
 ) -> Result<(), String> {
     if !crypt {
         let la = listener
@@ -492,7 +494,7 @@ pub(crate) fn run_source_with_listener(
             .unwrap_or_default();
         cleartext_allowed(&la)?;
     }
-    let conns = accept_streams(&listener, streams, wnd, "source", key.as_ref())?;
+    let conns = accept_streams(&listener, streams, wnd, "source", key.as_ref(), agent_gone)?;
     finish_source(
         conns, input, streams, progress, check, crypt, key, resume_from, json, preserve, rate,
     )
