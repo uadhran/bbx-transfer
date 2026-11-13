@@ -5,6 +5,10 @@ use std::env;
 
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("-V") | Some("--version")) {
+        println!("bbx {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.is_empty() {
         usage(1);
     }

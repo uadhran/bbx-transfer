@@ -116,11 +116,12 @@ Peer dial address host part:
 
 ## Threat model
 
-- **SSH** authenticates agent start and can carry the session PSK (banner / `BBX_KEY` env).
+- **SSH** authenticates agent start and can carry the session PSK (banner on the listener path, stdin after `--key-stdin` on the dial-out path).
 - **Data plane** with `-e`: payload AEAD; PSK+salt → unique key; SID MAC on accept; control blake3/preserve sealed; AAD binds header fields.
 - **Without `-e`**: cleartext TCP; **loopback only** by default (`BBX_ALLOW_CLEAR=1` for trusted non-loopback).
-- The session PSK reaches the remote via the banner `KEY` line (listener path) or a
-  `BBX_KEY=` environment assignment (dial-out path) — **never** `-k` on argv for remote agent start.
+- The session PSK reaches the remote via the banner `KEY` line (listener path) or one
+  64-hex line on the agent stdin after `--key-stdin` (dial-out path). The remote command
+  never contains `BBX_KEY=` or `-k`.
 - Salt travels clear on stream 0 (must, to derive). BLAKE3/mode/mtime are **not** clear under `-e` (sealed_meta).
 
 ## Liveness

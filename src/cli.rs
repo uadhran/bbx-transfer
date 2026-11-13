@@ -7,7 +7,7 @@ pub fn usage(code: i32) {
     eprintln!(
         "bbx — multi-stream bulk copy (BBX2)\n\n\
          bbx sink|source|cp …\n\
-         opts: -s N -w SIZE -P SEC -c|-C -e|-E -k HEX\n\
+         opts: -s N -w SIZE -P SEC -c|-C -e|-E -k HEX --key-stdin -V\n\
                -A resume  -J json  -r recurse dirs  -R BYTES\n\
                -z reverse  -Z LO-HI  listen port range (firewall)\n\
                --preserve mode+mtime  -x RATE  throttle bytes/sec\n\
@@ -46,6 +46,7 @@ pub(crate) struct Flags {
     pub(crate) crypt: bool,
     pub(crate) crypt_set: bool,
     pub(crate) key: Option<[u8; 32]>,
+    pub(crate) key_stdin: bool,
     pub(crate) reverse: bool,
     pub(crate) resume: bool,
     pub(crate) resume_from: u64,
@@ -74,6 +75,7 @@ pub(crate) fn parse_flags(args: &[String]) -> Result<Flags, String> {
         crypt: false,
         crypt_set: false,
         key: None,
+        key_stdin: false,
         reverse: false,
         resume: false,
         resume_from: 0,
@@ -142,6 +144,7 @@ pub(crate) fn parse_flags(args: &[String]) -> Result<Flags, String> {
                 i += 1;
                 f.key = Some(parse_key(need(args, i, "-k")?)?);
             }
+            "--key-stdin" => f.key_stdin = true,
             "-z" => f.reverse = true,
             "-A" => f.resume = true,
             "-J" => f.json = true,

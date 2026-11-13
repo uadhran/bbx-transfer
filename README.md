@@ -80,7 +80,8 @@ Auto-detect order: `BBX_ADVERTISE` → route toward remote host → default-rout
 | `-x RATE` | throttle bytes/sec (e.g. `10M`) |
 | `-z` | reverse dial |
 | `-Z LO-HI` | listen port range |
-| `-k HEX` | session key (manual; remote prefers `BBX_KEY` env) |
+| `-k HEX` | session key for manual sink/source. Prefer `BBX_KEY`: `-k` is on the local argv. |
+| `--key-stdin` | sink/source only. Read one 64-hex line from stdin. `bbx cp` places this after `source` or `sink` and writes the key on ssh stdin. |
 
 Env: `BBX_REMOTE`, `BBX_ADVERTISE`, `BBX_KEY`, `BBX_PORT_RANGE`, `BBX_IO_TIMEOUT_SECS` (default 120), `BBX_BIND` (listen host), `BBX_PEER_ALLOW` (comma-separated IPs; only `any` allows every peer; empty is ignored), `BBX_PEER_DEFAULT=ssh` (allow only the `SSH_CONNECTION` client), `BBX_AGENT_WAIT_SECS` (SSH agent wait), `BBX_ALLOW_CLEAR=1` (permit non-loopback cleartext).
 
@@ -98,7 +99,7 @@ Env: `BBX_REMOTE`, `BBX_ADVERTISE`, `BBX_KEY`, `BBX_PORT_RANGE`, `BBX_IO_TIMEOUT
 
 ## Security
 
-Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv). Data plane with `-e`: AEAD (PSK+salt), stream-id MAC, sealed BLAKE3/preserve meta, AAD-bound payload tags (both ends must match). Cleartext (`-E`) is **loopback-only** unless `BBX_ALLOW_CLEAR=1`. Resume (`-A`) requires BLAKE3 (`-c`). Optional: `BBX_BIND`, `BBX_PEER_ALLOW`, `BBX_PEER_DEFAULT=ssh`. See [SPEC.md](SPEC.md#threat-model).
+Session key over SSH: the listener path still uses the `KEY` banner. Dial-out (encrypted pull, push `-z`, and pull `-z` with a fixed key) writes one 64-hex line on the agent stdin. The remote command does not contain `BBX_KEY=` or `-k`. Manual sink and source still accept `BBX_KEY`. Data plane with `-e`: AEAD (PSK+salt), stream-id MAC, sealed BLAKE3/preserve meta, AAD-bound payload tags (both ends must match). Cleartext (`-E`) is **loopback-only** unless `BBX_ALLOW_CLEAR=1`. Resume (`-A`) requires BLAKE3 (`-c`). Optional: `BBX_BIND`, `BBX_PEER_ALLOW`, `BBX_PEER_DEFAULT=ssh`. See [SPEC.md](SPEC.md#threat-model).
 
 ## Limitations
 
@@ -106,6 +107,7 @@ Session key over SSH (`KEY` banner or `BBX_KEY` env — not `-k` on remote argv)
 - **1.0.0+ both ends for encrypt:** stream-id prefix + PSK/salt AEAD, stream-id MAC, sealed control meta, AAD-bound frames. Fresh receive is temp-then-rename; `-r` pull uses NUL listing; symlink path components under dest are refused. Implementation is a library crate under `src/`.
 - **1.0.1:** `-P` on a TTY uses an indicatif progress bar (`-J` JSON unchanged).
 - **1.0.2:** on 1.0.2, bbx cp listeners reject a peer whose address differs from the SSH host/client address; set BBX_PEER_ALLOW to that address or to "any".
+- **1.1.0:** `-V` and `--version` print `bbx 1.1.0`. On 1.1.0, encrypted `bbx cp` pull, push `-z`, and pull `-z` with a fixed key require a 1.1.0 remote. The key is no longer passed as `BBX_KEY=` in the ssh command.
 - **Encrypted wire:** control header includes 32-byte salt — peers without this framing will not interoperate.
 
 ## Docs

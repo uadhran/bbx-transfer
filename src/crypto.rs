@@ -79,7 +79,8 @@ pub fn aead_decrypt(
 }
 
 /// Session key from the `BBX_KEY` environment variable, if present and valid.
-/// Preferred over `-k` on the remote side: env is not shown by a plain `ps`.
+/// Manual sink/source only. `bbx cp` does not put this in the ssh command;
+/// those agents read the key from `--key-stdin`.
 pub(crate) fn env_key() -> Option<[u8; 32]> {
     let s = env::var("BBX_KEY").ok()?;
     parse_key(&s).ok()

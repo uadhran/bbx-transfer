@@ -1,10 +1,12 @@
 //! cp push/pull modes (forward/reverse) and remote file size probes.
 
 use crate::cli::{TransferOpts, z_flag};
-use crate::crypto::{gen_key, hex};
+use crate::crypto::gen_key;
 use crate::engine::{run_sink_connect, run_sink_with_listener, run_source_connect, run_source_with_listener};
 use crate::net::{advertise_ip, bind_ephemeral, ensure_local_peer_default, host_only};
-use crate::ssh::{ce_flags, finish_agent, resume_flag, shell_quote, ssh_spawn, ssh_start_banner};
+use crate::ssh::{
+    ce_flags, finish_agent, resume_flag, shell_quote, ssh_spawn, ssh_start_banner, OLD_AGENT_MSG,
+};
 use std::process::{Command, Stdio};
 
 pub(crate) fn preserve_flag(preserve: bool) -> &'static str {
@@ -53,8 +55,8 @@ pub(crate) fn cp_push_forward(
         shell_quote(rpath),
         resume_flag(opts.resume)
     );
-    let (mut child, port, banner_key, resume_from) =
-        ssh_start_banner(remote, &cmd, opts.crypt, opts.resume)?;
+    let (mut agent, port, banner_key, resume_from) =
+        ssh_start_banner(remote, &cmd, opts.crypt, opts.resume, None)?;
     let key = if opts.crypt {
         Some(fixed_key.or(banner_key).ok_or("encrypt: no session key from peer")?)
     } else {
@@ -82,7 +84,7 @@ pub(crate) fn cp_push_forward(
         opts.preserve,
         opts.rate,
     );
-    finish_agent(&mut child, r, "push remote sink")
+    finish_agent(&mut agent, r, "push remote sink")
 }
 
 pub(crate) fn cp_push_reverse(
@@ -114,12 +116,9 @@ pub(crate) fn cp_push_reverse(
     let xf = rate_flag(opts.rate);
     let streams = opts.streams;
     let wnd = opts.wnd;
-    let kenv = key
-        .as_ref()
-        .map(|k| format!("BBX_KEY={} ", hex(k)))
-        .unwrap_or_default();
+    let key_arg = if key.is_some() { " --key-stdin" } else { "" };
     let cmd = format!(
-        "{kenv}{} sink -a {} -o {} -s {streams} -w {wnd} {ce}{}{pf}{xf}",
+        "{} sink{key_arg} -a {} -o {} -s {streams} -w {wnd} {ce}{}{pf}{xf}",
         shell_quote(bin),
         shell_quote(&addr),
         shell_quote(rpath),
@@ -130,12 +129,17 @@ pub(crate) fn cp_push_reverse(
             "bbx: push -z {local_src} → {remote}:{rpath} dials {addr} resume_from={resume_from}"
         );
     }
-    let mut child = ssh_spawn(remote, &cmd)?;
+    let mut agent = ssh_spawn(remote, &cmd, key.as_ref())?;
     let r = {
-        let mut agent_gone = || match child.try_wait() {
-            Ok(Some(st)) => Some(format!("remote sink exited {st}")),
-            Ok(None) => None,
-            Err(e) => Some(format!("remote sink wait: {e}")),
+        let mut agent_gone = || {
+            if agent.saw_old_agent() {
+                return Some(OLD_AGENT_MSG.to_string());
+            }
+            match agent.child.try_wait() {
+                Ok(Some(st)) => Some(format!("remote sink exited {st}")),
+                Ok(None) => None,
+                Err(e) => Some(format!("remote sink wait: {e}")),
+            }
         };
         run_source_with_listener(
             listener,
@@ -153,7 +157,7 @@ pub(crate) fn cp_push_reverse(
             Some(&mut agent_gone),
         )
     };
-    finish_agent(&mut child, r, "push -z remote sink")
+    finish_agent(&mut agent, r, "push -z remote sink")
 }
 
 pub(crate) fn cp_pull_forward(
@@ -180,10 +184,7 @@ pub(crate) fn cp_pull_forward(
     let xf = rate_flag(opts.rate);
     let streams = opts.streams;
     let wnd = opts.wnd;
-    let kenv = key
-        .as_ref()
-        .map(|k| format!("BBX_KEY={} ", hex(k)))
-        .unwrap_or_default();
+    let key_arg = if key.is_some() { " --key-stdin" } else { "" };
     let rf = if opts.resume {
         std::fs::metadata(local_dst).map(|m| m.len()).unwrap_or(0)
     } else {
@@ -195,7 +196,7 @@ pub(crate) fn cp_pull_forward(
         String::new()
     };
     let cmd = format!(
-        "{kenv}{} source -a {} -i {} -s {streams} -w {wnd} {ce}{rarg}{pf}{xf}",
+        "{} source{key_arg} -a {} -i {} -s {streams} -w {wnd} {ce}{rarg}{pf}{xf}",
         shell_quote(bin),
         shell_quote(&addr),
         shell_quote(rpath)
@@ -203,12 +204,17 @@ pub(crate) fn cp_pull_forward(
     if !opts.json {
         eprintln!("bbx: pull {remote}:{rpath} → {local_dst} listen={addr} resume_from={rf}");
     }
-    let mut child = ssh_spawn(remote, &cmd)?;
+    let mut agent = ssh_spawn(remote, &cmd, key.as_ref())?;
     let r = {
-        let mut agent_gone = || match child.try_wait() {
-            Ok(Some(st)) => Some(format!("remote source exited {st}")),
-            Ok(None) => None,
-            Err(e) => Some(format!("remote source wait: {e}")),
+        let mut agent_gone = || {
+            if agent.saw_old_agent() {
+                return Some(OLD_AGENT_MSG.to_string());
+            }
+            match agent.child.try_wait() {
+                Ok(Some(st)) => Some(format!("remote source exited {st}")),
+                Ok(None) => None,
+                Err(e) => Some(format!("remote source wait: {e}")),
+            }
         };
         run_sink_with_listener(
             listener,
@@ -225,7 +231,7 @@ pub(crate) fn cp_pull_forward(
             Some(&mut agent_gone),
         )
     };
-    finish_agent(&mut child, r, "pull remote source")
+    finish_agent(&mut agent, r, "pull remote source")
 }
 
 pub(crate) fn cp_pull_reverse(
@@ -253,18 +259,16 @@ pub(crate) fn cp_pull_reverse(
     } else {
         String::new()
     };
-    let kenv = fixed_key
-        .as_ref()
-        .filter(|_| opts.crypt)
-        .map(|k| format!("BBX_KEY={} ", hex(k)))
-        .unwrap_or_default();
+    let send_key = fixed_key.filter(|_| opts.crypt);
+    let key_arg = if send_key.is_some() { " --key-stdin" } else { "" };
     let peer = peer_remote_prefix();
     let cmd = format!(
-        "{peer}{kenv}{} source -l 0.0.0.0:0{z} -i {} -s {streams} -w {wnd} {ce}{rarg}{pf}{xf}",
+        "{peer}{} source{key_arg} -l 0.0.0.0:0{z} -i {} -s {streams} -w {wnd} {ce}{rarg}{pf}{xf}",
         shell_quote(bin),
         shell_quote(rpath)
     );
-    let (mut child, port, banner_key, _) = ssh_start_banner(remote, &cmd, opts.crypt, false)?;
+    let (mut agent, port, banner_key, _) =
+        ssh_start_banner(remote, &cmd, opts.crypt, false, send_key.as_ref())?;
     let key = if opts.crypt {
         Some(fixed_key.or(banner_key).ok_or("encrypt: no session key from peer")?)
     } else {
@@ -288,7 +292,7 @@ pub(crate) fn cp_pull_reverse(
         opts.json,
         opts.rate,
     );
-    finish_agent(&mut child, r, "pull -z remote source")
+    finish_agent(&mut agent, r, "pull -z remote source")
 }
 
 pub(crate) fn remote_file_len(remote: &str, path: &str) -> Result<u64, String> {

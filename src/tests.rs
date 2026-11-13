@@ -9,6 +9,10 @@ use crate::net::{
     accept_streams, bind_ephemeral, cleartext_allowed, ensure_local_peer_default, peer_allowlist,
     split_listen_spec, validate_advertise,
 };
+use crate::ssh::{
+    feed_stderr_scan, finish_agent, release_relay, relay_stderr, ssh_spawn, SshAgent,
+    OLD_AGENT_MARK, OLD_AGENT_MSG, STDERR_RELAY_DRAIN,
+};
 use crate::tree::{dest_path_has_symlink, is_safe_rel, parse_find_print0, walk_local_files};
 use crate::util::split_ranges;
 
@@ -270,4 +274,150 @@ fn local_allowlist_loopback_advertise() {
     for (allow, expect, remote, advertise) in got {
         assert_eq!(allow, expect, "{remote} advertise={advertise}");
     }
+}
+
+#[test]
+fn old_agent_mark_survives_split_reads() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let saw = AtomicBool::new(false);
+    let mut carry = Vec::new();
+    let text = b"bbx: unknown flag --key-stdin\n";
+    for &b in text {
+        feed_stderr_scan(&mut carry, &[b], &saw);
+    }
+    assert!(saw.load(Ordering::Relaxed), "one-byte reads must still match");
+
+    let saw = AtomicBool::new(false);
+    let mut carry = Vec::new();
+    feed_stderr_scan(&mut carry, b"bbx: unknown flag --key-stdi", &saw);
+    assert!(!saw.load(Ordering::Relaxed));
+    feed_stderr_scan(&mut carry, b"n\n", &saw);
+    assert!(saw.load(Ordering::Relaxed));
+
+    let saw = AtomicBool::new(false);
+    let mut carry = Vec::new();
+    feed_stderr_scan(&mut carry, b"bbx: rejected something else\n", &saw);
+    assert!(!saw.load(Ordering::Relaxed));
+    assert_eq!(OLD_AGENT_MARK, b"unknown flag --key-stdin");
+}
+
+#[test]
+fn stderr_relay_stops_when_pipe_stays_open() {
+    use std::os::unix::io::FromRawFd;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let _write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    let saw = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(true));
+    let tail = Arc::new(Mutex::new(Vec::new()));
+    let start = std::time::Instant::now();
+    relay_stderr(read, saw, done, tail);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(100),
+        "drain bound was not applied: {elapsed:?}"
+    );
+    assert!(
+        elapsed < STDERR_RELAY_DRAIN + std::time::Duration::from_secs(1),
+        "relay blocked past the drain bound: {elapsed:?}"
+    );
+}
+
+#[test]
+fn shutdown_relay_detaches_when_thread_blocks() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    let done = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+    let mut relay = Some(thread::spawn({
+        let stop = Arc::clone(&stop);
+        let started = Arc::clone(&started);
+        move || {
+            started.store(true, Ordering::Relaxed);
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }));
+    while !started.load(Ordering::Relaxed) {
+        thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let start = std::time::Instant::now();
+    release_relay(&mut relay, &done);
+    let elapsed = start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    assert!(relay.is_none());
+    assert!(
+        elapsed >= std::time::Duration::from_millis(100),
+        "detached before the drain bound: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "release blocked past the drain bound: {elapsed:?}"
+    );
+}
+
+#[test]
+fn key_write_after_exit_reports_ssh_status() {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("echo 'ssh: Connection refused' >&2; exit 255")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut agent = SshAgent::start(child, stderr);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while agent.child.try_wait().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline, "helper did not exit");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let err = agent.write_key(&[0x11; 32]).unwrap_err();
+    assert!(err.contains("255"), "{err}");
+    assert!(err.contains("Connection refused"), "{err}");
+    assert!(!err.to_lowercase().contains("broken pipe"), "{err}");
+}
+
+#[test]
+fn old_remote_key_stdin_is_upgrade_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(
+        "bbx-fake-ssh-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ssh = dir.join("ssh");
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\ncat >/dev/null\necho 'bbx: unknown flag --key-stdin' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut perm = std::fs::metadata(&ssh).unwrap().permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&ssh, perm).unwrap();
+    let prev = std::env::var("PATH").unwrap_or_default();
+    unsafe {
+        std::env::set_var("PATH", format!("{}:{}", dir.display(), prev));
+    }
+    let result = ssh_spawn("host", "bbx source --key-stdin", Some(&[0x22; 32])).and_then(|mut agent| {
+        finish_agent(&mut agent, Ok(()), "remote")
+    });
+    unsafe {
+        std::env::set_var("PATH", &prev);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = result.unwrap_err();
+    assert_eq!(err, OLD_AGENT_MSG);
 }
