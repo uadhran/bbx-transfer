@@ -23,6 +23,7 @@ Honest split: **shipped**, **open**, **out of scope for now**.
 | **1.0.1** | `-P` TTY progress via indicatif; fix duplicate final 100% line |
 | **1.0.2** | Drop a bad handshake instead of aborting; `cp` listeners allow only the named peer unless `BBX_PEER_ALLOW=any`; pull and push `-z` stop when the remote SSH child has exited |
 | **1.1.0** | Session key to the remote agent on stdin (`--key-stdin`), not `BBX_KEY=` in the ssh command; `-V` / `--version` |
+| **1.1.1** | Test-only fix for the key-stdin command-line test; first 1.1.x release with binaries |
 | **C8 partial** | Windows: `FileExt` cfg only (not full support) |
 
 Protocol: [SPEC.md](SPEC.md).

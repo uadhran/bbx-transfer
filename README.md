@@ -108,6 +108,7 @@ Session key over SSH: the listener path still uses the `KEY` banner. Dial-out (e
 - **1.0.1:** `-P` on a TTY uses an indicatif progress bar (`-J` JSON unchanged).
 - **1.0.2:** on 1.0.2, bbx cp listeners reject a peer whose address differs from the SSH host/client address; set BBX_PEER_ALLOW to that address or to "any".
 - **1.1.0:** `-V` and `--version` print `bbx 1.1.0`. On 1.1.0, encrypted `bbx cp` pull, push `-z`, and pull `-z` with a fixed key require a 1.1.0 remote. The key is no longer passed as `BBX_KEY=` in the ssh command.
+- **1.1.1:** `-V` and `--version` print `bbx 1.1.1`. Test-only fix; 1.1.0 and 1.1.1 binaries interoperate.
 - **Encrypted wire:** control header includes 32-byte salt — peers without this framing will not interoperate.
 
 ## Docs
