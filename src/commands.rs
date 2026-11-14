@@ -212,10 +212,18 @@ fn read_key_stdin() -> Result<[u8; 32], String> {
     parse_key(line.trim_end_matches('\r')).map_err(|e| format!("key-stdin: {e}"))
 }
 
-/// Cap streams for small files (tree mode stability).
+/// Cap streams for small files (tree mode stability). Same rule for push and pull.
+pub(crate) fn streams_for_len(len: u64, streams: usize) -> usize {
+    if len <= TREE_SINGLE_STREAM_MAX && streams > 1 {
+        1
+    } else {
+        streams
+    }
+}
+
 pub(crate) fn streams_for_file(path: &str, streams: usize) -> usize {
     match std::fs::metadata(path).map(|m| m.len()) {
-        Ok(n) if n <= TREE_SINGLE_STREAM_MAX && streams > 1 => 1,
-        _ => streams,
+        Ok(n) => streams_for_len(n, streams),
+        Err(_) => streams,
     }
 }

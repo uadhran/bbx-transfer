@@ -1,7 +1,7 @@
 //! Recursive (-r) tree walk, remote listing, and per-file tree orchestration.
 
 use crate::cli::TransferOpts;
-use crate::commands::streams_for_file;
+use crate::commands::{streams_for_file, streams_for_len};
 use crate::cp::{cp_pull_forward, cp_pull_reverse, cp_push_forward, cp_push_reverse};
 use crate::ssh::shell_quote;
 use std::io;
@@ -91,18 +91,92 @@ pub(crate) fn parse_find_print0(stdout: &[u8]) -> Vec<String> {
     files
 }
 
-pub(crate) fn remote_list_files(remote: &str, rpath: &str) -> Result<Vec<String>, String> {
-    // NUL-delimited so names may contain newlines/spaces; do not trim components.
-    let out = Command::new("ssh")
+/// How many characters of a bad listing record to keep in the error.
+const LISTING_RECORD_SHOW: usize = 80;
+
+fn show_listing_record(raw: &[u8]) -> String {
+    let slice = if raw.len() > 256 { &raw[..256] } else { raw };
+    let mut s = String::from_utf8_lossy(slice).replace('\0', "\\0");
+    let truncated = raw.len() > 256 || s.chars().count() > LISTING_RECORD_SHOW;
+    if s.chars().count() > LISTING_RECORD_SHOW {
+        s = s.chars().take(LISTING_RECORD_SHOW).collect();
+    }
+    if truncated {
+        s.push('…');
+    }
+    s
+}
+
+fn malformed_listing(index: usize, raw: &[u8]) -> String {
+    format!(
+        "remote listing: malformed entry {index}: {}",
+        show_listing_record(raw)
+    )
+}
+
+/// Parse GNU `find -printf '%s\0%p\0'` into `(size, relative path)`.
+/// A bad record fails the listing; the error includes its index and a short copy.
+pub(crate) fn parse_find_printf_sizes(stdout: &[u8]) -> Result<Vec<(u64, String)>, String> {
+    if stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut parts: Vec<&[u8]> = stdout.split(|&b| b == 0).collect();
+    if parts.last().is_some_and(|p| p.is_empty()) {
+        parts.pop();
+    }
+    if parts.len() % 2 != 0 {
+        let idx = parts.len() / 2;
+        return Err(malformed_listing(idx, parts[parts.len() - 1]));
+    }
+    let mut files = Vec::with_capacity(parts.len() / 2);
+    for (idx, pair) in parts.chunks(2).enumerate() {
+        let size_b = pair[0];
+        let path_b = pair[1];
+        let len = std::str::from_utf8(size_b)
+            .ok()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u64>().ok());
+        let Some(len) = len else {
+            let mut raw = Vec::with_capacity(size_b.len() + 1 + path_b.len());
+            raw.extend_from_slice(size_b);
+            raw.push(0);
+            raw.extend_from_slice(path_b);
+            return Err(malformed_listing(idx, &raw));
+        };
+        let mut rel = String::from_utf8_lossy(path_b).into_owned();
+        if let Some(rest) = rel.strip_prefix("./") {
+            rel = rest.to_string();
+        }
+        if rel.is_empty() {
+            let mut raw = Vec::with_capacity(size_b.len() + 1 + path_b.len());
+            raw.extend_from_slice(size_b);
+            raw.push(0);
+            raw.extend_from_slice(path_b);
+            return Err(malformed_listing(idx, &raw));
+        }
+        files.push((len, rel));
+    }
+    files.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(files)
+}
+
+/// Unsupported `-printf`: find failed, wrote nothing, and named the option.
+pub(crate) fn find_printf_unsupported(success: bool, stdout: &[u8], stderr: &[u8]) -> bool {
+    !success && stdout.is_empty() && String::from_utf8_lossy(stderr).contains("-printf")
+}
+
+fn ssh_find(remote: &str, cmd: &str) -> Result<std::process::Output, String> {
+    Command::new("ssh")
         .arg(remote)
-        .arg(format!(
-            "cd {} && find . -type f -print0",
-            shell_quote(rpath)
-        ))
+        .arg(cmd)
         .stdin(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("ssh find: {e}"))?;
+        .map_err(|e| format!("ssh find: {e}"))
+}
+
+fn remote_list_print0(remote: &str, quoted: &str) -> Result<Vec<String>, String> {
+    let out = ssh_find(remote, &format!("cd {quoted} && find . -type f -print0"))?;
     if !out.status.success() {
         return Err(format!(
             "remote find failed: {}",
@@ -110,6 +184,33 @@ pub(crate) fn remote_list_files(remote: &str, rpath: &str) -> Result<Vec<String>
         ));
     }
     Ok(parse_find_print0(&out.stdout))
+}
+
+/// Sized listing when GNU find accepts `-printf`. `None` size means the
+/// `-print0` fallback (one stream per file). One ssh call on the success path.
+pub(crate) fn remote_list_files(
+    remote: &str,
+    rpath: &str,
+) -> Result<Vec<(Option<u64>, String)>, String> {
+    let quoted = shell_quote(rpath);
+    // Single quotes so the remote shell leaves `\0` for GNU find.
+    let out = ssh_find(
+        remote,
+        &format!("cd {quoted} && find . -type f -printf '%s\\0%p\\0'"),
+    )?;
+    if out.status.success() {
+        return parse_find_printf_sizes(&out.stdout)
+            .map(|v| v.into_iter().map(|(n, p)| (Some(n), p)).collect());
+    }
+    if find_printf_unsupported(out.status.success(), &out.stdout, &out.stderr) {
+        eprintln!("bbx: warning: remote find has no -printf; using 1 stream per file");
+        let names = remote_list_print0(remote, &quoted)?;
+        return Ok(names.into_iter().map(|p| (None, p)).collect());
+    }
+    Err(format!(
+        "remote find failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    ))
 }
 
 /// One SSH round-trip for many parents (tree push).
@@ -281,7 +382,7 @@ pub(crate) fn cp_pull_tree(
 ) -> Result<(), String> {
     let files = remote_list_files(remote, rpath)?;
     if files.is_empty() {
-        return Err("no remote files found (need find -print0)".into());
+        return Err("no regular files were found under the remote path".into());
     }
     let dest_root = Path::new(local_dst);
     std::fs::create_dir_all(dest_root).map_err(|e| e.to_string())?;
@@ -294,7 +395,7 @@ pub(crate) fn cp_pull_tree(
     if !opts.json {
         eprintln!("bbx: pull -r {} files from {}:{rpath}", files.len(), remote);
     }
-    for (i, rel) in files.iter().enumerate() {
+    for (i, (len, rel)) in files.iter().enumerate() {
         if !is_safe_rel(rel) {
             return Err(format!("unsafe remote path rejected: {rel:?}"));
         }
@@ -314,8 +415,18 @@ pub(crate) fn cp_pull_tree(
                 ));
             }
         }
+        let nstreams = match len {
+            Some(n) => streams_for_len(*n, opts.streams),
+            None if opts.streams > 1 => 1,
+            None => opts.streams,
+        };
         if !opts.json {
-            eprintln!("bbx: [{}/{}] {}", i + 1, files.len(), rel);
+            eprintln!(
+                "bbx: [{}/{}] {} streams={nstreams}",
+                i + 1,
+                files.len(),
+                rel
+            );
         } else {
             println!(
                 r#"{{"event":"file","index":{},"total":{},"path":{:?}}}"#,
@@ -325,9 +436,8 @@ pub(crate) fn cp_pull_tree(
             );
         }
         let local_s = local_file.to_string_lossy();
-        // Pull: remote size unknown cheaply; use single stream for tree stability.
         let mut o = opts;
-        o.streams = if opts.streams > 1 { 1 } else { opts.streams };
+        o.streams = nstreams;
         if rev {
             cp_pull_reverse(bin, remote, &remote_file, &local_s, o, port_range, fixed_key)?;
         } else {

@@ -75,7 +75,7 @@ Auto-detect order: `BBX_ADVERTISE` → route toward remote host → default-rout
 | `-A` | resume partial dest |
 | `-R N` | source: resume from byte offset N |
 | `-J` | JSON progress on stdout |
-| `-r` | recursive dirs (**one session per file**; files ≤1 MiB use **1 stream**) |
+| `-r` | recursive dirs (**one session per file**; files ≤1 MiB use **1 stream**). Pull sizes come from GNU find; without `-printf`, one stream per file. |
 | `--preserve` / `-p` | preserve mode + mtime |
 | `-x RATE` | throttle bytes/sec (e.g. `10M`) |
 | `-z` | reverse dial |
@@ -109,6 +109,7 @@ Session key over SSH: the listener path still uses the `KEY` banner. Dial-out (e
 - **1.0.2:** on 1.0.2, bbx cp listeners reject a peer whose address differs from the SSH host/client address; set BBX_PEER_ALLOW to that address or to "any".
 - **1.1.0:** `-V` and `--version` print `bbx 1.1.0`. On 1.1.0, encrypted `bbx cp` pull, push `-z`, and pull `-z` with a fixed key require a 1.1.0 remote. The key is no longer passed as `BBX_KEY=` in the ssh command.
 - **1.1.1:** `-V` and `--version` print `bbx 1.1.1`. Test-only fix; 1.1.0 and 1.1.1 binaries interoperate.
+- **1.1.2:** `-r` pull reads each file's size with GNU `find -printf`. Files of 1 MiB or less use 1 stream; larger files use `-s`. If the remote find has no `-printf`, bbx warns once and uses 1 stream per file.
 - **Encrypted wire:** control header includes 32-byte salt — peers without this framing will not interoperate.
 
 ## Docs

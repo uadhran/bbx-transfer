@@ -685,7 +685,8 @@ pub(crate) fn finish_source(
 
 fn make_progress_bar(size: u64, initial: u64) -> ProgressBar {
     let pb = ProgressBar::new(size);
-    pb.set_position(initial);
+    // set_position draws immediately. set_style does not, so the style must
+    // be in place first or the first line is indicatif's default wide bar.
     pb.set_style(
         ProgressStyle::with_template(
             "bbx: [{bar:24.cyan/blue}] {percent:>3}%  {bytes_per_sec}  ETA {eta}",
@@ -693,6 +694,7 @@ fn make_progress_bar(size: u64, initial: u64) -> ProgressBar {
         .expect("progress template")
         .progress_chars("##-"),
     );
+    pb.set_position(initial);
     pb
 }
 

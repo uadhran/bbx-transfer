@@ -2,7 +2,7 @@
 use std::io::Write;
 
 use crate::cli::{parse_key, parse_port_range};
-use crate::commands::{is_remote_spec, split_host_path};
+use crate::commands::{is_remote_spec, split_host_path, streams_for_len};
 use crate::crypto::{aead_decrypt, aead_encrypt, derive_aead_key, frame_aad, gen_key, hex, stream_id_tag};
 use crate::engine::sink_work_path;
 use crate::net::{
@@ -13,7 +13,11 @@ use crate::ssh::{
     feed_stderr_scan, finish_agent, release_relay, relay_stderr, ssh_spawn, SshAgent,
     OLD_AGENT_MARK, OLD_AGENT_MSG, STDERR_RELAY_DRAIN,
 };
-use crate::tree::{dest_path_has_symlink, is_safe_rel, parse_find_print0, walk_local_files};
+use crate::tree::{
+    dest_path_has_symlink, find_printf_unsupported, is_safe_rel, parse_find_print0,
+    parse_find_printf_sizes, walk_local_files,
+};
+use crate::TREE_SINGLE_STREAM_MAX;
 use crate::util::split_ranges;
 
 
@@ -119,6 +123,75 @@ fn parse_find_print0_keeps_spaces_and_newlines() {
     assert!(files.iter().any(|f| f == "dir/\nfile.txt"));
     // no trim of internal spaces
     assert!(!files.iter().any(|f| f == "a b.txt ".trim() && f.ends_with(' ')));
+}
+
+#[test]
+fn parse_find_printf_sizes_keeps_names_and_empty() {
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"5\0./a b.txt\0");
+    raw.extend_from_slice(b"3\0./dir/\tfile.txt\0");
+    raw.extend_from_slice(b"4\0./dir/\nfile.txt\0");
+    raw.extend_from_slice(b"0\0./empty\0");
+    raw.extend_from_slice(b"1\0plain\0");
+    let files = parse_find_printf_sizes(&raw).unwrap();
+    assert_eq!(
+        files,
+        vec![
+            (5, "a b.txt".into()),
+            (3, "dir/\tfile.txt".into()),
+            (4, "dir/\nfile.txt".into()),
+            (0, "empty".into()),
+            (1, "plain".into()),
+        ]
+    );
+}
+
+#[test]
+fn parse_find_printf_sizes_malformed_names_the_record() {
+    let err = parse_find_printf_sizes(b"0\0ok\0nope\0bad\0").unwrap_err();
+    assert!(err.contains("malformed entry 1"), "{err}");
+    assert!(err.contains("nope\\0bad"), "{err}");
+
+    let err = parse_find_printf_sizes(b"12\0").unwrap_err();
+    assert!(err.contains("malformed entry 0"), "{err}");
+    assert!(err.contains("12"), "{err}");
+
+    let mut raw = vec![b'9'; 200];
+    raw.extend_from_slice(b"\0name\0");
+    let err = parse_find_printf_sizes(&raw).unwrap_err();
+    assert!(err.contains("malformed entry 0"), "{err}");
+    assert!(err.contains('…'), "{err}");
+    assert!(err.chars().count() < 160, "{err}");
+    assert!(!err.contains(&"9".repeat(120)), "{err}");
+}
+
+#[test]
+fn streams_for_len_matches_tree_cap() {
+    let cap = TREE_SINGLE_STREAM_MAX;
+    assert_eq!(streams_for_len(0, 8), 1);
+    assert_eq!(streams_for_len(cap, 8), 1);
+    assert_eq!(streams_for_len(cap + 1, 8), 8);
+    assert_eq!(streams_for_len(cap + 1, 1), 1);
+}
+
+#[test]
+fn find_printf_unsupported_is_empty_stdout_naming_the_option() {
+    assert!(find_printf_unsupported(
+        false,
+        b"",
+        b"find: unrecognized: -printf\n"
+    ));
+    assert!(!find_printf_unsupported(
+        false,
+        b"",
+        b"find: ./missing: No such file or directory\n"
+    ));
+    assert!(!find_printf_unsupported(
+        false,
+        b"1\0a\0",
+        b"find: unrecognized: -printf\n"
+    ));
+    assert!(!find_printf_unsupported(true, b"", b"find: unrecognized: -printf\n"));
 }
 
 #[test]

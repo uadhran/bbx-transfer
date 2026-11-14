@@ -45,7 +45,7 @@ Payload covers only `[resume_from, size)`. **Resume always sends the full contro
 
 **Fresh sink write:** the sink writes a temporary file beside the destination (same directory), verifies integrity, then renames over the final path. A failed fresh transfer does not truncate/delete a pre-existing destination.
 
-**Recursive pull paths:** remote listing uses `find -print0` (NUL-delimited). Local dest rejects symlink path components so a remote path cannot escape through a local symlink.
+**Recursive pull paths:** remote listing uses GNU `find -printf '%s\0%p\0'` (NUL-separated size and path). If the remote find has no `-printf`, listing falls back to `find -print0` and each file uses one stream. Local dest rejects symlink path components so a remote path cannot escape through a local symlink.
 
 ## Payload
 
